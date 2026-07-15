@@ -1,0 +1,26 @@
+# Node
+frontend/node_modules/
+frontend/.next/
+
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/*.pyc
+
+# Env
+.env
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Qdrant
+backend/qdrant_db/
+backend/stored_files/
+backend/processed_files.json
+
+# Agent long-term memory storage
+backend/memory_storage/
