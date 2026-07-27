@@ -46,6 +46,7 @@ def _run_agent(query: str, language: str, conversation_id: str) -> dict:
     return {
         "answer": answer,
         "sources": build_sources_from_dicts(context.documents, lang=context.language),
+        "report": context.report,
     }
 
 
@@ -59,6 +60,7 @@ async def chat(request: ChatRequest):
             "answer": result["answer"],
             "sources": result["sources"],
             "stt_text": "",
+            "report": result["report"],
         }
     except Exception as e:
         log.exception("Agent chat error")
@@ -91,6 +93,7 @@ async def chat_voice(
             "answer": result["answer"],
             "sources": result["sources"],
             "stt_text": stt_text,
+            "report": result["report"],
         }
     except Exception as e:
         log.exception("Agent voice chat error")

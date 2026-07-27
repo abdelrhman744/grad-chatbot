@@ -103,6 +103,40 @@ class GroqLLM:
         content = choice.message.content or ""
         return content.strip()
 
+    # ── Streaming interface (used by agent.run_stream / /ws/chat) ─────────
+    def stream(self, prompt: str):
+        """Yield text deltas for a single-prompt completion as they arrive."""
+        yield from self.stream_chat([{"role": "user", "content": prompt}])
+
+    def stream_chat(self, messages: List[dict]):
+        """
+        Yield text deltas for a chat completion as they arrive from Groq.
+        Mirrors `chat()` but with `stream=True`; callers accumulate the
+        yielded pieces themselves if they need the full text at the end.
+        """
+        client = _get_client()
+
+        kwargs = dict(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p,
+            stream=True,
+        )
+
+        try:
+            stream = client.chat.completions.create(**kwargs)
+            for event in stream:
+                if not event.choices:
+                    continue
+                delta = event.choices[0].delta.content
+                if delta:
+                    yield delta
+        except Exception as e:
+            log.error(f"Groq streaming API call failed (model={self.model}): {e}")
+            raise
+
 
 # ── Shared singleton instances ──────────────────────────────────────────────
 # Mirrors the previous module-level `llm = OllamaLLM(...)` pattern so the

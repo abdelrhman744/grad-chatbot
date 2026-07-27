@@ -11,6 +11,62 @@ and when to summarize or compare what it has found.
 
 ---
 
+## What's New: Streaming, MinIO Storage & PDF Reports
+
+Three additions on top of the original agentic RAG pipeline:
+
+- ⚡ **Real-time streaming answers (WebSockets)** — `/ws/chat` streams the
+  agent's final answer token-by-token as it's generated, instead of
+  waiting for the whole response. The frontend chat box renders it live,
+  ChatGPT-style. See `backend/routes/ws.py`, `Agent.run_stream()` in
+  `backend/agent/agent.py`, and `streamChat()` in `frontend/services/api.ts`.
+- 🗄️ **MinIO object storage for uploads** — uploaded originals (PDF/DOCX/
+  images/etc.) are stored in a MinIO bucket instead of local disk, so they
+  survive container restarts and can be served via presigned URLs. See
+  `backend/services/storage_service.py` and `docker-compose.yml` for a
+  local MinIO instance.
+- 📄 **Per-document PDF report generation — fully inside the chat, no
+  Swagger, no buttons.** The agent's existing LLM-based intent planner
+  (the same "thought → action" ReAct loop that already decides
+  retrieve/generate/summarize/compare) now also recognises a `report`
+  intent — semantically, not by keyword matching — from natural
+  requests in English, Arabic, or mixed ("generate a report", "اعمل
+  تقرير", "طلعلي PDF عن المستند"). It automatically figures out *which*
+  uploaded document you mean (the one you're actively discussing, or
+  the only one you've uploaded, or it asks you to pick if there are
+  several), re-reads that document in full, and produces a
+  comprehensive, professional multi-section PDF — cover page,
+  auto-numbered table of contents, executive summary, introduction,
+  detailed per-topic sections, key concepts, definitions, technical
+  terms, important numbers, equations, referenced figures/tables, best
+  practices, relationships between concepts, conclusion, and
+  references, with page citations wherever possible. Large documents
+  are processed section-by-section (map) and combined (reduce) instead
+  of hitting token limits. The finished PDF is stored in MinIO and shows
+  up right in the chat as a download card. See
+  `backend/agent/tools/report_tool.py`, `backend/services/report_service.py`,
+  and `backend/agent/prompt.py` (tool #6, "report").
+
+**Setup for these three:**
+
+```bash
+# 1. Start MinIO (uploads + generated reports bucket)
+docker compose up -d
+# Console: http://localhost:9001  (minioadmin / minioadmin)
+
+# 2. Install the new backend deps (already in requirements.txt)
+pip install -r backend/requirements.txt
+
+# 3. Copy env files and adjust if needed
+cp backend/.env.example backend/.env
+cp frontend/.env.example frontend/.env.local   # optional, only if backend isn't on :8000
+```
+
+No extra setup is needed for streaming — `/ws/chat` is served by the same
+FastAPI app as the REST routes.
+
+---
+
 ## 1. Project Overview
 
 This project started as a straightforward RAG chatbot and has been extended
@@ -110,30 +166,36 @@ ai-doc-assistant/
 │   ├── config.py                   All environment-driven settings
 │   ├── requirements.txt
 │   ├── .env.example
+│   ├── assets/fonts/               Bundled Amiri Arabic font (PDF reports)
 │   ├── agent/
-│   │   ├── agent.py                ReAct loop
+│   │   ├── agent.py                ReAct loop (+ run_stream for /ws/chat)
 │   │   ├── llm.py                  Groq-backed action-selection LLM (JSON mode)
 │   │   ├── prompt.py                Planner system/user prompts
 │   │   ├── registry.py             Tool registry factory
 │   │   ├── schemas.py              Pydantic action/context schemas
 │   │   ├── session.py              Per-conversation Agent registry
-│   │   └── tools/                  retrieve / generate / summarize / compare / respond
+│   │   └── tools/                  retrieve / generate / summarize / compare / respond / report
 │   ├── memory/                     Short-term + persisted long-term summary memory
 │   ├── routes/
 │   │   ├── chat.py                 /api/chat, /api/chat/voice, /api/chat/reset
-│   │   ├── upload.py               /api/upload, /api/stored-files
+│   │   ├── ws.py                   /ws/chat — streaming WebSocket chat
+│   │   ├── upload.py               /api/upload, /api/stored-files, file download
+│   │   ├── reports.py              /api/reports/generate, report download
 │   │   └── health.py               /api/health
 │   └── services/
 │       ├── rag_service.py          Core RAG pipeline (ingest, retrieve, prompt, generate)
-│       ├── llm_provider.py         Groq client wrapper (invoke / chat)
+│       ├── llm_provider.py         Groq client wrapper (invoke / chat / stream)
 │       ├── embeddings_provider.py  Embeddings factory (huggingface / openai)
 │       ├── db_service.py           Qdrant client/collection helpers
+│       ├── storage_service.py      MinIO object storage wrapper
+│       ├── report_service.py       Map-reduce summarization + PDF rendering
 │       ├── audio_service.py        Whisper transcription
 │       └── ocr_service.py          Tesseract/OpenCV OCR
+├── docker-compose.yml              Local MinIO instance
 └── frontend/
     ├── app/                        Next.js App Router pages
     ├── components/                 ChatBox, AnswerBox, SourceBox, UploadBox, VoiceRecorder
-    ├── services/api.ts             Typed fetch wrapper for the backend API
+    ├── services/api.ts             Typed fetch wrapper + WebSocket streamChat()
     └── next.config.js              Dev-time rewrite: /api/* → http://localhost:8000/api/*
 ```
 

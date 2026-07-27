@@ -70,14 +70,25 @@ class Settings:
     QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "enterprise_docs")
 
     # ── RAG pipeline ─────────────────────────────────────────────────────
+    # Deprecated: originals are now stored in MinIO (MINIO_BUCKET_UPLOADS).
+    # Kept only so old .env files with this var set don't error out.
     UPLOAD_FOLDER: str = os.getenv("UPLOAD_FOLDER", "./stored_files")
     PROCESSED_FILES_REGISTRY: str = os.getenv(
         "PROCESSED_FILES_REGISTRY", "./processed_files.json"
     )
     ENABLE_PDF_OCR_FALLBACK: bool = _bool("ENABLE_PDF_OCR_FALLBACK", True)
-    RETRIEVER_K: int = _int("RETRIEVER_K", 6)
-    RERANK_TOP_N: int = _int("RERANK_TOP_N", 4)
-    CONFIDENCE_THRESHOLD: float = _float("CONFIDENCE_THRESHOLD", 0.02)
+    RETRIEVER_K: int = _int("RETRIEVER_K", 8)
+    RERANK_TOP_N: int = _int("RERANK_TOP_N", 6)
+    # Coarse pre-filter only (see _retrieve() in rag_service.py) — lexical
+    # overlap score below which retrieved chunks are discarded entirely as
+    # "no relevant match". Kept low deliberately: testing showed this
+    # lexical heuristic cannot reliably separate on-topic from off-topic
+    # questions on its own (a loosely-worded but genuine question can score
+    # similarly to an unrelated one), so it only catches near-zero-overlap
+    # cases. The real grounding guard is the LLM prompt rule in
+    # build_prompt() that refuses to answer unless the context specifically
+    # covers the question.
+    CONFIDENCE_THRESHOLD: float = _float("CONFIDENCE_THRESHOLD", 0.05)
     CHUNK_SIZE: int = _int("CHUNK_SIZE", 700)
     CHUNK_OVERLAP: int = _int("CHUNK_OVERLAP", 150)
 
@@ -97,6 +108,25 @@ class Settings:
     MEMORY_KEEP_RECENT: int = _int("MEMORY_KEEP_RECENT", 4)
     MEMORY_WINDOW: int = _int("MEMORY_WINDOW", 6)
     MEMORY_STORAGE_DIR: str = os.getenv("MEMORY_STORAGE_DIR", "./memory_storage")
+
+    # ── MinIO (object storage for uploaded files & generated reports) ─────
+    # Uploaded originals are no longer written to local disk — they are
+    # streamed straight into a MinIO bucket. Set these to point at your own
+    # MinIO deployment (see docker-compose.yml for a local dev instance).
+    MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+    MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    MINIO_SECURE: bool = _bool("MINIO_SECURE", False)
+    MINIO_BUCKET_UPLOADS: str = os.getenv("MINIO_BUCKET_UPLOADS", "doc-assistant-uploads")
+    MINIO_BUCKET_REPORTS: str = os.getenv("MINIO_BUCKET_REPORTS", "doc-assistant-reports")
+    # How long a generated presigned download URL stays valid, in seconds.
+    MINIO_PRESIGNED_EXPIRY: int = _int("MINIO_PRESIGNED_EXPIRY", 3600)
+
+    # ── Report generation (per-document PDF summary) ───────────────────────
+    REPORT_MAP_CHUNK_CHARS: int = _int("REPORT_MAP_CHUNK_CHARS", 6000)
+    REPORT_FONT_DIR: str = os.getenv(
+        "REPORT_FONT_DIR", str(BASE_DIR / "assets" / "fonts")
+    )
 
 
 settings = Settings()

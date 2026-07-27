@@ -22,10 +22,11 @@ class ToolName(str, Enum):
     SUMMARIZE = "summarize"
     COMPARE = "compare"
     RESPOND = "respond"
+    REPORT = "report"
 
 
 TERMINAL_TOOLS = frozenset(
-    {ToolName.GENERATE, ToolName.SUMMARIZE, ToolName.COMPARE, ToolName.RESPOND}
+    {ToolName.GENERATE, ToolName.SUMMARIZE, ToolName.COMPARE, ToolName.RESPOND, ToolName.REPORT}
 )
 
 
@@ -50,6 +51,14 @@ class SummarizeArguments(BaseModel):
 
 class RespondArguments(BaseModel):
     question: str
+
+
+class ReportArguments(BaseModel):
+    # Optional: only set if the user explicitly named a document
+    # ("اعمل تقرير عن ملف العقود", "make a report on the networks pdf").
+    # Left empty when the user just says "generate a report" — the tool
+    # resolves the target itself (active/only/ambiguous document).
+    document: str | None = None
 
 
 # ── Actions ──────────────────────────────────────────────────────────────────
@@ -84,6 +93,11 @@ class RespondAction(BaseAction):
     arguments: RespondArguments
 
 
+class ReportAction(BaseAction):
+    action: Literal[ToolName.REPORT]
+    arguments: ReportArguments
+
+
 AgentAction = Annotated[
     Union[
         RetrieveAction,
@@ -91,6 +105,7 @@ AgentAction = Annotated[
         CompareAction,
         SummarizeAction,
         RespondAction,
+        ReportAction,
     ],
     Field(discriminator="action"),
 ]
@@ -111,6 +126,14 @@ class ExecutionContext(BaseModel):
     summary: str | None = None
     comparison: str | None = None
     answer: str | None = None
+
+    # Set by the report tool once a PDF report has been generated:
+    # {"filename", "object_name", "download_url", "proxy_download_path"}.
+    report: dict | None = None
+
+    # Set by the report tool instead of `report` when it needs the user
+    # to pick which uploaded document to report on (list of filenames).
+    needs_clarification: list[str] | None = None
 
     # Detected language for this turn ("ar" / "en")
     language: str = "en"

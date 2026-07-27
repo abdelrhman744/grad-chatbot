@@ -41,10 +41,9 @@ from services.db_service import get_client, get_collection_name, ensure_collecti
 from services.embeddings_provider import get_embeddings
 from services.llm_provider import GroqLLM, get_llm as _get_shared_llm
 from services.ocr_service import perform_ocr_pdf_bytes, perform_ocr_image_bytes
+from services import storage_service
 
 log = logging.getLogger("rag_service")
-
-os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
 
 # ── Models ──────────────────────────────────────────────────────────────────
 # `embeddings` powers Qdrant indexing/retrieval; `llm` powers every text
@@ -412,35 +411,7 @@ def _lex_score(query: str, doc_text: str, lang: str) -> float:
     return min(uni_score + bigram_score, 1.0)
 
 
-def _confidence(question: str, docs: List[Document], lang: str) -> float:
-    if not docs:
-        return 0.0
-
-    variants = _query_variants(question, lang)
-    scores = []
-
-    for qv in variants:
-        q_lang = detect_language(qv)
-        kws = _keywords(qv, q_lang)
-
-        if not kws:
-            continue
-
-        for doc in docs[:settings.RERANK_TOP_N]:
-            content = _normalize(_clean(doc.page_content))
-            score = sum(1 for kw in kws if kw in content) / len(kws)
-            scores.append(score)
-
-    if not scores:
-        return 0.05
-
-    best = max(scores)
-    bonus = 0.03 if best > 0 else 0.0
-
-    return min(best + bonus, 1.0)
-
-
-# ── Reranking ──────────────────────────────────────────────────────────────────
+# ── Reranking ────────────────────────────────────────────────────────────────
 
 def _rerank(variants: List[str], docs: List[Document], top_n: Optional[int] = None) -> Tuple[List[Document], List[dict]]:
     """
@@ -541,6 +512,25 @@ def _retrieve(question: str, lang: str, k: Optional[int] = None, top_n: Optional
 
     ranked, debugs = _rerank(variants, all_docs, top_n=top_n)
 
+    if not debugs:
+        return [], "no docs retrieted after rerank"
+
+    top_score = debugs[0]["score"]
+
+    # Coarse, defense-in-depth filter only: this lexical overlap score is a
+    # heuristic and NOT a reliable topic-relevance classifier on its own
+    # (short/loosely-worded but genuinely relevant questions can score
+    # similarly to unrelated ones). It only catches near-zero-overlap
+    # queries. The real grounding guarantee is the "answer only if the
+    # context specifically covers the question, else say unavailable" rule
+    # in build_prompt() — this is just a cheap first line of defense.
+    if top_score < settings.CONFIDENCE_THRESHOLD:
+        debug_str = "\n".join(
+            f"Rank {i+1}: {d['source']} p{d['page']} score={d['score']} | {d['preview'][:80]}"
+            for i, d in enumerate(debugs)
+        )
+        return [], f"{debug_str}\n[top score {top_score} below CONFIDENCE_THRESHOLD={settings.CONFIDENCE_THRESHOLD} — treating as no relevant match]"
+
     debug_str = "\n".join(
         f"Rank {i+1}: {d['source']} p{d['page']} score={d['score']} | {d['preview'][:80]}"
         for i, d in enumerate(debugs)
@@ -560,12 +550,14 @@ def build_prompt(context: str, question: str, lang: str) -> str:
 1. اقرأ السياق كاملاً قبل الكتابة.
 2. السؤال قد يكون بالعربية والسياق بالإنجليزية أو العكس؛ افهم المعنى بين اللغتين.
 3. السؤال قد يحتوي على أخطاء إملائية أو حروف ناقصة أو كلمات عامية؛ حاول فهم المقصود من السياق.
-4. إذا وجدت معلومة مرتبطة أو قريبة جدًا من السؤال في السياق، أجب بها ولا تقل إن المعلومة غير موجودة.
-5. لا تقل "المعلومة غير موجودة في الملفات المرفوعة" إلا إذا كان السياق لا يحتوي على أي معلومة مرتبطة بالسؤال نهائيًا.
-6. لا تستخدم أي معرفة خارجية خارج السياق.
+4. أجب من السياق فقط إذا كان يحتوي بشكل مباشر ومحدد على المعلومة المطلوبة في السؤال — وليس مجرد موضوع مشابه أو قريب.
+5. إذا كان السياق لا يحتوي على المعلومة المحددة المطلوبة، يجب أن تقول "المعلومة غير موجودة في الملفات المرفوعة." لا تجب إجابة جزئية بالاعتماد على فقرة قريبة الموضوع فقط، ولا تسد الفجوة بمعرفتك الخاصة — حتى لو كنت متأكدًا أنها معلومة صحيحة في الواقع. هذا النظام يجب أن يجيب حصريًا من المستندات المرفوعة، ولا شيء غير ذلك.
+6. لا تستخدم أي معرفة خارجية خارج السياق تحت أي ظرف، حتى للأسئلة التي تستطيع الإجابة عنها بسهولة بنفسك (حقائق عامة، تعريفات، أحداث جارية، إلخ). إذا لم تكن المعلومة في السياق، فلا تضعها في الإجابة.
 7. لا تبدأ بعبارات مثل "بناءً على السياق" أو "وفقاً للمعلومات".
 8. لا تكرر السؤال في الإجابة.
 9. اذكر الأرقام والتواريخ والأسماء كما وردت في السياق.
+9ب. حافظ على المعادلات والصيغ والوحدات والمصطلحات التقنية كما هي بالضبط في السياق؛ لا تعيد صياغتها أو تقرّبها أو تبسّطها.
+9ج. لا تخترع رقمًا أو اسمًا أو مصطلحًا أو حقيقة غير موجودة في السياق، حتى لو كان ذلك لسد فجوة أو لجعل الإجابة تبدو مكتملة.
 10. الإجابة بالعربية الواضحة، مع الحفاظ على المصطلحات الإنجليزية المهمة كما هي.
 11. بعد الإجابة، قدم مثالًا بسيطًا إذا كان مناسبًا.
 12. استخدم تنسيق:
@@ -587,12 +579,14 @@ def build_prompt(context: str, question: str, lang: str) -> str:
 1. Read the entire context before writing.
 2. The question and context may be in different languages. Understand the meaning across Arabic and English.
 3. The question may contain spelling mistakes, missing letters, dialect words, or mixed Arabic/English terms. Infer the intended meaning from the context.
-4. If the context contains related or very close information, answer using it. Do not say it is unavailable.
-5. Only say "The information is not available in the uploaded files." if the context has no related information at all.
-6. Do not use external knowledge outside the context.
+4. Answer using the context ONLY if it specifically and directly contains the information the question is asking for — not merely a related or similar topic.
+5. If the context does not contain the specific information requested, you MUST say "The information is not available in the uploaded files." Do not partially answer using a superficially related passage, and do not fill the gap with your own knowledge — even if you are confident it is correct real-world information. This system must answer strictly from the uploaded documents, nothing else.
+6. Do not use external knowledge outside the context, under any circumstance, even for questions you could easily answer yourself (general facts, definitions, current events, etc.). If it isn't in the context, it isn't in the answer.
 7. Do not open with "Based on the context" or "According to the information".
 8. Do not repeat the question.
 9. State numbers, dates, and names exactly as they appear in the context.
+9b. Preserve equations, formulas, units, and technical terms exactly as written in the context — do not paraphrase, round, or simplify them.
+9c. Never invent a number, name, term, or fact that is not present in the context, even to fill a gap or sound complete.
 10. Answer in clear English, preserving important Arabic or English technical terms when needed.
 11. After the answer, provide a simple example if useful.
 12. Use format:
@@ -693,19 +687,39 @@ def _safe_filename(filename: str) -> str:
     return name.strip() or "unknown"
 
 
+_CONTENT_TYPES = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "doc": "application/msword",
+    "txt": "text/plain",
+    "markdown": "text/markdown",
+    "json": "application/json",
+    "image": "application/octet-stream",
+}
+
+
 def _save_uploaded_file(filename: str, data: bytes, fhash: str) -> str:
+    """
+    Upload the original file bytes to the MinIO uploads bucket instead of
+    local disk. Returns the MinIO object key (stored in the registry as
+    "stored_path" for backward compatibility with existing callers/fields).
+    """
     safe_name = _safe_filename(filename)
     stem, ext = os.path.splitext(safe_name)
 
-    stored_name = f"{stem}_{fhash[:10]}{ext}"
-    stored_path = os.path.join(settings.UPLOAD_FOLDER, stored_name)
+    object_name = f"{stem}_{fhash[:10]}{ext}"
+    content_type = _CONTENT_TYPES.get(_get_file_type(filename), "application/octet-stream")
 
-    os.makedirs(settings.UPLOAD_FOLDER, exist_ok=True)
+    storage_service.upload_bytes(
+        settings.MINIO_BUCKET_UPLOADS, object_name, data, content_type=content_type
+    )
 
-    with open(stored_path, "wb") as f:
-        f.write(data)
+    return object_name
 
-    return stored_path
+
+def get_stored_file_bytes(object_name: str) -> bytes:
+    """Download a previously uploaded file's raw bytes from MinIO."""
+    return storage_service.download_bytes(settings.MINIO_BUCKET_UPLOADS, object_name)
 
 
 def list_stored_files() -> list[dict]:
@@ -713,16 +727,62 @@ def list_stored_files() -> list[dict]:
     files = []
 
     for _, info in registry.items():
+        object_name = info.get("stored_path")
         files.append({
             "filename": info.get("filename"),
-            "stored_path": info.get("stored_path"),
+            "stored_path": object_name,
             "file_type": info.get("file_type"),
             "chunks": info.get("chunks", 0),
             "processed_at": info.get("processed_at"),
+            "download_url": storage_service.presigned_url(
+                settings.MINIO_BUCKET_UPLOADS, object_name
+            ) if object_name else None,
         })
 
     files.sort(key=lambda x: x.get("processed_at") or "", reverse=True)
     return files
+
+
+def find_registry_entry(filename: str) -> Optional[dict]:
+    """Look up a stored file's registry entry (incl. its MinIO object key)
+    by original filename. Used by the report-generation endpoint."""
+    registry = _load_registry()
+    for info in registry.values():
+        if info.get("filename") == filename:
+            return info
+    return None
+
+
+def get_document_pages(filename: str) -> List[dict]:
+    """
+    Re-download a previously ingested file from MinIO and re-extract its
+    full text, page by page: [{"page": <int>, "text": "..."}, ...].
+    Used by report_service to build a comprehensive report while keeping
+    track of which page each fact/section came from.
+    """
+    entry = find_registry_entry(filename)
+    if not entry:
+        raise FileNotFoundError(f"No stored file found for '{filename}'.")
+
+    data = get_stored_file_bytes(entry["stored_path"])
+    docs = _load_document_from_bytes(filename, data)
+
+    pages: dict[int, list[str]] = {}
+    for d in docs:
+        page = d.metadata.get("page", 0)
+        pages.setdefault(page, []).append(d.page_content)
+
+    return [
+        {"page": page + 1, "text": "\n".join(texts).strip()}
+        for page, texts in sorted(pages.items())
+        if "\n".join(texts).strip()
+    ]
+
+
+def get_document_full_text(filename: str) -> str:
+    """Convenience wrapper over `get_document_pages` for callers that just
+    want the whole document as one string, without page boundaries."""
+    return "\n\n".join(p["text"] for p in get_document_pages(filename))
 
 
 def _get_file_type(filename: str) -> str:
@@ -811,7 +871,7 @@ def _load_document_from_bytes(filename: str, data: bytes) -> List[Document]:
 def update_db_files(files: List[dict[str, Any]]) -> int:
     """
     Ingest a list of {'filename': str, 'data': bytes} dicts into Qdrant.
-    Also saves uploaded files physically inside settings.UPLOAD_FOLDER.
+    Also uploads the original file bytes to MinIO (settings.MINIO_BUCKET_UPLOADS).
     Returns total number of chunks added.
     """
     registry = _load_registry()
@@ -1029,17 +1089,52 @@ def generate_answer(question: str, documents: List[dict], lang: str = "auto", me
         return f"Error generating answer: {e}"
 
 
-def answer_from_memory(question: str, memory: str, lang: str = "auto") -> str:
+def generate_answer_stream(question: str, documents: List[dict], lang: str = "auto", memory: str = ""):
     """
-    Answer a question using only conversation memory (no document retrieval).
-    Used when the agent decides retrieval isn't needed (greetings, follow-ups
-    about the conversation itself, etc).
+    Streaming counterpart of `generate_answer`: yields text chunks as the
+    Groq API produces them, instead of returning the full string at once.
+    Used by the agent's `run_stream` for the /ws/chat WebSocket endpoint.
     """
     detected_lang = detect_language(question) if lang == "auto" else lang
 
-    if detected_lang == "ar":
-        prompt = f"""أنت مساعد محادثة ودود. أجب على رسالة المستخدم باستخدام ذاكرة المحادثة أدناه فقط إذا كانت ذات صلة.
-إذا كانت رسالة ترحيبية أو عامة، رد بشكل طبيعي دون اختلاق معلومات.
+    if not documents:
+        yield ("لا توجد مستندات كافية للإجابة على هذا السؤال."
+               if detected_lang == "ar"
+               else "No relevant documents were found to answer this question.")
+        return
+
+    context_parts = [
+        f"[Chunk {i+1} | {d['metadata'].get('source','?')} | page {d['metadata'].get('page',0)}]\n{d['text']}"
+        for i, d in enumerate(documents)
+    ]
+    context = "\n\n---\n\n".join(context_parts)
+
+    prompt = build_prompt_with_memory(context, question, detected_lang, memory)
+
+    try:
+        for chunk in llm.stream(prompt):
+            yield chunk
+    except Exception as e:
+        log.error(f"[agent] generate_answer_stream error: {e}")
+        yield f"Error generating answer: {e}"
+
+
+def _memory_only_prompt(question: str, memory: str, lang: str) -> str:
+    """
+    Prompt for the 'respond' tool / no-document fallback: strictly scoped
+    to greetings, small talk, and questions about the conversation itself.
+    Explicitly forbidden from answering general-knowledge/factual questions
+    from the model's own training data — this system must only ever answer
+    from the uploaded documents.
+    """
+    if lang == "ar":
+        return f"""أنت وحدة رد صغيرة داخل نظام سؤال وجواب عن مستندات مرفوعة. هذا النظام يجيب حصريًا من المستندات المرفوعة — لا من معرفتك العامة.
+
+استخدم هذا الرد فقط لأحد الحالات التالية:
+- تحية أو مجاملة أو شكر أو وداع.
+- سؤال عن المحادثة نفسها (مثل "ايه اللي سألتك عليه قبل كده؟") ويمكن الإجابة عليه من ذاكرة المحادثة أدناه فقط.
+
+إذا كانت رسالة المستخدم تطلب أي معلومة أو حقيقة أو تفسير (حتى لو كانت معلومة عامة تعرفها جيدًا، مثل عاصمة دولة أو حدث تاريخي أو تعريف علمي) ولم تكن هذه المعلومة مذكورة حرفيًا في ذاكرة المحادثة أدناه، فلا تجب عليها من معرفتك. بدلاً من ذلك، رد بأدب أن هذا النظام يجيب فقط من المستندات المرفوعة، واقترح أن يسأل عن محتوى المستندات.
 
 ذاكرة المحادثة:
 {memory or "لا توجد ذاكرة سابقة."}
@@ -1048,10 +1143,14 @@ def answer_from_memory(question: str, memory: str, lang: str = "auto") -> str:
 {question}
 
 الرد:"""
-    else:
-        prompt = f"""You are a friendly conversational assistant. Answer the user's message using the
-conversation memory below only if relevant. If it's a greeting or general remark, reply naturally
-without inventing information.
+
+    return f"""You are a small response module inside a document Q&A system. This system answers strictly from uploaded documents — never from your own general knowledge.
+
+Only use this reply for one of these cases:
+- A greeting, thanks, small talk, or farewell.
+- A question about the conversation itself (e.g. "what did I just ask you?") that the conversation memory below can answer.
+
+If the user's message asks for any fact, information, or explanation — even something you personally know well, like a country's capital, a historical event, or a scientific definition — and that information is NOT explicitly present in the conversation memory below, do not answer it from your own knowledge. Instead, politely say this system only answers questions about the uploaded documents, and invite them to ask about the documents.
 
 Conversation memory:
 {memory or "No prior memory."}
@@ -1060,6 +1159,72 @@ User message:
 {question}
 
 Reply:"""
+
+
+def answer_from_memory_stream(question: str, memory: str, lang: str = "auto"):
+    """Streaming counterpart of `answer_from_memory`."""
+    detected_lang = detect_language(question) if lang == "auto" else lang
+    prompt = _memory_only_prompt(question, memory, detected_lang)
+
+    try:
+        for chunk in llm.stream(prompt):
+            yield chunk
+    except Exception as e:
+        log.error(f"[agent] answer_from_memory_stream error: {e}")
+        yield f"Error generating answer: {e}"
+
+
+def summarize_stream(documents: List[dict], lang: str = "en"):
+    """Streaming counterpart of `summarize`."""
+    if not documents:
+        yield "لا توجد مستندات لتلخيصها." if lang == "ar" else "No documents found to summarize."
+        return
+
+    document_text = "\n\n".join(d["text"] for d in documents)
+    prompt = (
+        f"لخّص المستندات التالية بإيجاز ووضوح، بالاعتماد فقط على ما ورد فيها حرفيًا، دون إضافة أي معلومة من خارجها:\n\n{document_text}"
+        if lang == "ar"
+        else f"Summarize the following documents clearly and concisely, using only what is stated in them — do not add any information from outside them:\n\n{document_text}"
+    )
+
+    try:
+        for chunk in llm.stream(prompt):
+            yield chunk
+    except Exception as e:
+        log.error(f"[agent] summarize_stream error: {e}")
+        yield f"Error generating summary: {e}"
+
+
+def compare_stream(question: str, documents: List[dict], lang: str = "en"):
+    """Streaming counterpart of `compare`."""
+    if not documents:
+        yield "لا توجد مستندات كافية للمقارنة." if lang == "ar" else "No documents found to compare."
+        return
+
+    document_text = "\n\n".join(d["text"] for d in documents)
+    prompt = (
+        f"باستخدام المستندات التالية حصريًا (لا تستخدم أي معرفة خارجية)، أجب عن طلب المقارنة. إذا كانت المستندات لا تحتوي على معلومات كافية للمقارنة المطلوبة، قل ذلك صراحة:\n\nالسؤال:\n{question}\n\nالمستندات:\n\n{document_text}"
+        if lang == "ar"
+        else f"Using only the following documents (no outside knowledge), answer this comparison request. If the documents do not contain enough information for the requested comparison, say so explicitly:\n\nQuestion:\n{question}\n\nDocuments:\n\n{document_text}"
+    )
+
+    try:
+        for chunk in llm.stream(prompt):
+            yield chunk
+    except Exception as e:
+        log.error(f"[agent] compare_stream error: {e}")
+        yield f"Error generating comparison: {e}"
+
+
+def answer_from_memory(question: str, memory: str, lang: str = "auto") -> str:
+    """
+    Answer a question using only conversation memory (no document retrieval).
+    Strictly scoped to greetings/small talk/meta-conversation — see
+    `_memory_only_prompt` for the full rule set. Used by the 'respond' tool
+    and by 'generate' when no documents were retrieved but memory exists.
+    """
+    detected_lang = detect_language(question) if lang == "auto" else lang
+    prompt = _memory_only_prompt(question, memory, detected_lang)
 
     try:
         answer = str(llm.invoke(prompt))
@@ -1077,9 +1242,9 @@ def summarize(documents: List[dict], lang: str = "en") -> str:
     document_text = "\n\n".join(d["text"] for d in documents)
 
     if lang == "ar":
-        prompt = f"لخّص المستندات التالية بإيجاز ووضوح:\n\n{document_text}"
+        prompt = f"لخّص المستندات التالية بإيجاز ووضوح، بالاعتماد فقط على ما ورد فيها حرفيًا، دون إضافة أي معلومة من خارجها:\n\n{document_text}"
     else:
-        prompt = f"Summarize the following documents clearly and concisely:\n\n{document_text}"
+        prompt = f"Summarize the following documents clearly and concisely, using only what is stated in them — do not add any information from outside them:\n\n{document_text}"
 
     try:
         return _clean(str(llm.invoke(prompt)))
@@ -1096,9 +1261,9 @@ def compare(question: str, documents: List[dict], lang: str = "en") -> str:
     document_text = "\n\n".join(d["text"] for d in documents)
 
     if lang == "ar":
-        prompt = f"باستخدام المستندات التالية فقط، أجب عن طلب المقارنة:\n\nالسؤال:\n{question}\n\nالمستندات:\n\n{document_text}"
+        prompt = f"باستخدام المستندات التالية حصريًا (لا تستخدم أي معرفة خارجية)، أجب عن طلب المقارنة. إذا كانت المستندات لا تحتوي على معلومات كافية للمقارنة المطلوبة، قل ذلك صراحة:\n\nالسؤال:\n{question}\n\nالمستندات:\n\n{document_text}"
     else:
-        prompt = f"Using only the following documents, answer this comparison request:\n\nQuestion:\n{question}\n\nDocuments:\n\n{document_text}"
+        prompt = f"Using only the following documents (no outside knowledge), answer this comparison request. If the documents do not contain enough information for the requested comparison, say so explicitly:\n\nQuestion:\n{question}\n\nDocuments:\n\n{document_text}"
 
     try:
         return _clean(str(llm.invoke(prompt)))

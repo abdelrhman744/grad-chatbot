@@ -19,3 +19,11 @@ numpy
 pillow
 docx2txt
 pypdf
+
+# MinIO object storage (uploaded files)
+minio
+
+# PDF report generation
+reportlab
+arabic-reshaper
+python-bidi

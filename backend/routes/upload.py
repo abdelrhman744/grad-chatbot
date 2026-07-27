@@ -1,7 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from typing import List
 
-from services.rag_service import update_db_files, list_stored_files
+from services.rag_service import update_db_files, list_stored_files, get_stored_file_bytes
 
 router = APIRouter()
 
@@ -44,3 +45,20 @@ async def stored_files():
     return {
         "files": list_stored_files()
     }
+
+
+@router.get("/files/{object_name}/download")
+async def download_stored_file(object_name: str):
+    """Stream a previously uploaded file's bytes back from MinIO. Used as
+    a fallback when the client can't reach MinIO's presigned URL directly
+    (e.g. MinIO bound to an internal Docker hostname)."""
+    try:
+        data = get_stored_file_bytes(object_name)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"File not found: {e}")
+
+    return StreamingResponse(
+        iter([data]),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{object_name}"'},
+    )

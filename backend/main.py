@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes.upload import router as upload_router
 from routes.chat import router as chat_router
 from routes.health import router as health_router
+from routes.ws import router as ws_router
+from routes.reports import router as reports_router
 from services.rag_service import load_existing_db
 
 logging.basicConfig(
@@ -26,6 +28,8 @@ app.add_middleware(
 app.include_router(upload_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(health_router, prefix="/api")
+app.include_router(reports_router, prefix="/api")
+app.include_router(ws_router)  # exposes /ws/chat (no /api prefix, plain WebSocket path)
 
 
 @app.on_event("startup")

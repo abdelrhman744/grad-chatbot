@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
-import { uploadFiles } from "@/services/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { FileText } from "lucide-react";
+import { uploadFiles, getStoredFiles, StoredFile } from "@/services/api";
 
 const ACCEPTED = ".pdf,.docx,.doc,.txt,.md,.json,.png,.jpg,.jpeg";
 
@@ -10,27 +11,42 @@ interface Props {
 }
 
 export default function UploadBox({ onUploaded }: Props) {
-  const [dragging,  setDragging]  = useState(false);
-  const [loading,   setLoading]   = useState(false);
-  const [status,    setStatus]    = useState<{ ok: boolean; msg: string } | null>(null);
-  const [fileNames, setFileNames] = useState<string[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [files, setFiles] = useState<StoredFile[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const handleFiles = useCallback(async (files: File[]) => {
-    if (!files.length) return;
-    setFileNames(files.map((f) => f.name));
-    setLoading(true);
-    setStatus(null);
+  const refreshFiles = useCallback(async () => {
     try {
-      const res = await uploadFiles(files);
-      setStatus({ ok: true, msg: `${res.message} (${res.chunks_added} chunks added)` });
-      onUploaded(res.message, res.chunks_added);
-    } catch (e: any) {
-      setStatus({ ok: false, msg: e.message });
-    } finally {
-      setLoading(false);
+      setFiles(await getStoredFiles());
+    } catch {
+      // Non-fatal — the sidebar just won't show the stored-files list.
     }
-  }, [onUploaded]);
+  }, []);
+
+  useEffect(() => {
+    refreshFiles();
+  }, [refreshFiles]);
+
+  const handleFiles = useCallback(
+    async (selected: File[]) => {
+      if (!selected.length) return;
+      setLoading(true);
+      setStatus(null);
+      try {
+        const res = await uploadFiles(selected);
+        setStatus({ ok: true, msg: `${res.message} (${res.chunks_added} chunks added)` });
+        onUploaded(res.message, res.chunks_added);
+        await refreshFiles();
+      } catch (e: any) {
+        setStatus({ ok: false, msg: e.message });
+      } finally {
+        setLoading(false);
+      }
+    },
+    [onUploaded, refreshFiles]
+  );
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -99,23 +115,25 @@ export default function UploadBox({ onUploaded }: Props) {
         )}
       </div>
 
-      {/* File list */}
-      {fileNames.length > 0 && !loading && (
-        <ul className="mt-3 space-y-1">
-          {fileNames.map((n) => (
-            <li key={n} className="flex items-center gap-2 text-sm text-muted">
-              <span className="w-1.5 h-1.5 rounded-full bg-teal flex-shrink-0" />
-              {n}
-            </li>
-          ))}
-        </ul>
-      )}
-
       {/* Status */}
       {status && (
         <p className={`mt-3 text-sm font-medium ${status.ok ? "text-teal" : "text-accent"}`}>
           {status.ok ? "✓ " : "✗ "}{status.msg}
         </p>
+      )}
+
+      {/* Stored files — informational only. Ask the chatbot for a report
+          ("generate a report", "اعمل تقرير") instead of a manual button;
+          the agent resolves which uploaded file to use on its own. */}
+      {files.length > 0 && (
+        <ul className="mt-4 space-y-1.5">
+          {files.map((f) => (
+            <li key={f.filename} className="flex items-center gap-2 text-sm text-muted">
+              <FileText className="w-3.5 h-3.5 flex-shrink-0 text-teal" />
+              <span className="truncate" title={f.filename}>{f.filename}</span>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
