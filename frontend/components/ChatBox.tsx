@@ -2,10 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Globe2, Languages, Loader2, SendHorizontal, Mic2 } from "lucide-react";
-import { askVoice, resetConversation, streamChat, ChatResponse, ReportInfo } from "@/services/api";
+import { askQuestion, askVoice, resetConversation, ChatResponse } from "@/services/api";
 import AnswerBox from "./AnswerBox";
 import SourceBox from "./SourceBox";
-import ReportCard from "./ReportCard";
 import VoiceRecorder from "./VoiceRecorder";
 
 type Language = "auto" | "ar" | "en";
@@ -17,8 +16,6 @@ interface Message {
   sources?: string;
   stt?: string;
   loading?: boolean;
-  statusText?: string;
-  report?: ReportInfo | null;
 }
 
 interface Props {
@@ -70,38 +67,8 @@ export default function ChatBox({ resetSignal }: Props) {
               ...m,
               text: res.answer,
               sources: res.sources,
-              report: res.report,
               loading: false,
             }
-          : m
-      )
-    );
-  };
-
-  const setAIStatus = (aiId: string, statusText: string) => {
-    setMessages((prev) =>
-      prev.map((m) => (m.id === aiId ? { ...m, statusText, loading: true } : m))
-    );
-  };
-
-  const appendAIToken = (aiId: string, token: string) => {
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === aiId ? { ...m, text: m.text + token, loading: false, statusText: undefined } : m
-      )
-    );
-  };
-
-  const finalizeAIMessage = (
-    aiId: string,
-    answer: string,
-    sources: string,
-    report?: ReportInfo | null
-  ) => {
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === aiId
-          ? { ...m, text: answer || m.text, sources, loading: false, statusText: undefined, report }
           : m
       )
     );
@@ -115,7 +82,6 @@ export default function ChatBox({ resetSignal }: Props) {
               ...m,
               text: `Error: ${err}`,
               loading: false,
-              statusText: undefined,
             }
           : m
       )
@@ -133,18 +99,14 @@ export default function ChatBox({ resetSignal }: Props) {
 
     const aiId = addUserMessage(q);
 
-    streamChat(q, language, "default", {
-      onStatus: (text) => setAIStatus(aiId, text),
-      onToken: (token) => appendAIToken(aiId, token),
-      onDone: ({ answer, sources, report }) => {
-        finalizeAIMessage(aiId, answer, sources, report);
-        setSubmitting(false);
-      },
-      onError: (message) => {
-        failAIMessage(aiId, message);
-        setSubmitting(false);
-      },
-    });
+    try {
+      const res = await askQuestion(q, language);
+      resolveAIMessage(aiId, res);
+    } catch (err: any) {
+      failAIMessage(aiId, err.message || "Request failed");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const handleVoice = async (blob: Blob) => {
@@ -241,9 +203,8 @@ export default function ChatBox({ resetSignal }: Props) {
                   </div>
                 ) : (
                   <>
-                    <AnswerBox text={msg.text} isLoading={!!msg.loading} statusText={msg.statusText} />
+                    <AnswerBox text={msg.text} isLoading={!!msg.loading} />
                     {msg.sources && <SourceBox sources={msg.sources} />}
-                    {msg.report && <ReportCard report={msg.report} isArabic={isArabicText(msg.text)} />}
                   </>
                 )}
               </div>

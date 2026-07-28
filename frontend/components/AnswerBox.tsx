@@ -4,27 +4,17 @@ interface Props {
   text: string;
   isLoading: boolean;
   isAr?: boolean;
-  statusText?: string;
 }
 
 const isArabicText = (text: string) => /[\u0600-\u06FF]/.test(text);
 
-export default function AnswerBox({ text, isLoading, isAr, statusText }: Props) {
+export default function AnswerBox({ text, isLoading, isAr }: Props) {
   if (isLoading) {
-    const rtl = isAr || (statusText ? isArabicText(statusText) : false);
     return (
-      <div
-        className="flex items-center gap-2 px-4 py-3 rounded-2xl rounded-bl-sm bg-white border border-ash shadow-sm w-fit"
-        dir={rtl ? "rtl" : "ltr"}
-      >
-        <span className="flex items-center gap-1.5">
-          <span className="typing-dot" />
-          <span className="typing-dot" />
-          <span className="typing-dot" />
-        </span>
-        {statusText && (
-          <span className={`text-xs text-muted ${rtl ? "font-arabic" : ""}`}>{statusText}</span>
-        )}
+      <div className="flex items-center gap-1.5 px-4 py-3 rounded-2xl rounded-bl-sm bg-white border border-ash shadow-sm w-fit">
+        <span className="typing-dot" />
+        <span className="typing-dot" />
+        <span className="typing-dot" />
       </div>
     );
   }
