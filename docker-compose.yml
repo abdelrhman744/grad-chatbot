@@ -1,0 +1,36 @@
+# Local MinIO instance for development.
+#
+# The backend talks to MinIO over the S3 API (port 9000); the web console
+# (port 9001) is just for browsing buckets/objects by hand while developing.
+#
+# Usage:
+#   docker compose up -d
+#   # Console:  http://localhost:9001  (login: minioadmin / minioadmin)
+#   # API:      http://localhost:9000  (matches MINIO_ENDPOINT=localhost:9000
+#   #           in backend/.env — see backend/.env.example)
+#
+# Buckets (doc-assistant-uploads, doc-assistant-reports) are created
+# automatically by the backend on first use (services/storage_service.py),
+# so no manual setup is required after the container is up.
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: doc-assistant-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  minio_data:
