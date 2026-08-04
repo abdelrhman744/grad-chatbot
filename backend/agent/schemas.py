@@ -60,6 +60,14 @@ class ReportArguments(BaseModel):
     # resolves the target itself (active/only/ambiguous document).
     document: str | None = None
 
+    # Optional: set when the user asked for a report ABOUT A SUBJECT rather
+    # than about a specific document ("اعمل تقرير عن الذكاء الاصطناعي",
+    # "generate a report about the sales section"). When set, the report
+    # tool searches all uploaded knowledge for this topic instead of
+    # summarizing one whole document; `document`, if also set, narrows that
+    # search to a single named document instead of the whole knowledge base.
+    topic: str | None = None
+
 
 # ── Actions ──────────────────────────────────────────────────────────────────
 

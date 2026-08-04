@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
@@ -8,6 +9,7 @@ from agent.session import get_agent, reset_agent
 from config import settings
 from services.audio_service import transcribe_audio
 from services.rag_service import build_sources_from_dicts
+from utils import timing
 
 log = logging.getLogger("routes.chat")
 
@@ -54,8 +56,21 @@ def _run_agent(query: str, language: str, conversation_id: str) -> dict:
 async def chat(request: ChatRequest):
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
+    # Started here (on the event-loop thread) and picked up via contextvars
+    # by asyncio.to_thread below, so every stage() call anywhere in the
+    # agent/rag_service/memory pipeline for this request lands on the same
+    # RequestTimer — see utils/timing.py.
+    if settings.LOG_REQUEST_PROFILE:
+        timing.start(f"POST /api/chat conversation={request.conversation_id!r} query={request.query[:60]!r}")
     try:
-        result = _run_agent(request.query, request.language, request.conversation_id)
+        # The agent's LLM calls are synchronous (blocking) — run them on a
+        # worker thread so one slow request doesn't stall the event loop
+        # for every other concurrent user, matching the pattern /ws/chat
+        # already uses (routes/ws.py).
+        result = await asyncio.to_thread(
+            _run_agent, request.query, request.language, request.conversation_id
+        )
         return {
             "answer": result["answer"],
             "sources": result["sources"],
@@ -65,6 +80,10 @@ async def chat(request: ChatRequest):
     except Exception as e:
         log.exception("Agent chat error")
         raise HTTPException(status_code=500, detail=_error_detail(e))
+    finally:
+        report = timing.finish()
+        if report:
+            log.info("\n" + report)
 
 
 @router.post("/chat/voice")
@@ -88,7 +107,7 @@ async def chat_voice(
         )
 
     try:
-        result = _run_agent(stt_text, language, conversation_id)
+        result = await asyncio.to_thread(_run_agent, stt_text, language, conversation_id)
         return {
             "answer": result["answer"],
             "sources": result["sources"],

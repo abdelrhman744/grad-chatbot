@@ -9,6 +9,17 @@ Thin wrapper around the MinIO client used as object storage for:
 This is the ONLY module that talks to MinIO directly; everything else
 (rag_service, report_service, routes) goes through the small functions
 exposed here so the rest of the app never imports the `minio` SDK.
+
+MinIO is an OPTIONAL runtime dependency: the `minio` package may not be
+installed, or the MinIO server it points at may not be running. Neither
+case should ever prevent the FastAPI app from starting or break document
+ingestion/chat/retrieval — those don't need object storage at all. Only
+downloading an original uploaded file and generating/downloading PDF
+reports actually require MinIO to be installed and reachable; every
+function below raises `StorageUnavailableError` in that case instead of
+letting an ImportError/connection error propagate as an unhandled crash,
+so callers (rag_service, report_service, routes) can catch it and degrade
+gracefully (see `_save_uploaded_file` in rag_service.py).
 """
 
 from __future__ import annotations
@@ -18,22 +29,44 @@ import logging
 from datetime import timedelta
 from typing import Optional
 
-from minio import Minio
-from minio.error import S3Error
-
 from config import settings
 
 log = logging.getLogger("storage_service")
 
-_client: Optional[Minio] = None
+try:
+    from minio import Minio
+    from minio.error import S3Error
+    _SDK_AVAILABLE = True
+except ImportError:
+    Minio = None  # type: ignore[assignment,misc]
+    S3Error = Exception  # so `except S3Error` below still works when unused
+    _SDK_AVAILABLE = False
+    log.warning(
+        "The 'minio' package is not installed — object storage (original "
+        "file downloads, PDF report storage) is disabled. Run "
+        "`pip install -r requirements.txt` to enable it; everything else "
+        "(upload/chat/retrieval/memory) still works without it."
+    )
+
+
+class StorageUnavailableError(RuntimeError):
+    """Raised when object storage is unavailable: the `minio` package isn't
+    installed, or the configured MinIO server can't be reached."""
+
+
+_client: Optional["Minio"] = None
 
 # Buckets are created lazily on first use and cached here so we don't hit
 # MinIO's bucket-exists API on every single upload/download call.
 _ensured_buckets: set[str] = set()
 
 
-def get_client() -> Minio:
+def get_client() -> "Minio":
     global _client
+    if not _SDK_AVAILABLE:
+        raise StorageUnavailableError(
+            "Object storage is unavailable: the 'minio' package is not installed."
+        )
     if _client is None:
         _client = Minio(
             settings.MINIO_ENDPOINT,
@@ -61,6 +94,8 @@ def ensure_bucket(bucket: str) -> None:
 
 def is_available() -> bool:
     """Best-effort connectivity check, used by the health endpoint."""
+    if not _SDK_AVAILABLE:
+        return False
     try:
         get_client().list_buckets()
         return True
@@ -118,10 +153,10 @@ def delete_object(bucket: str, object_name: str) -> None:
 
 def presigned_url(bucket: str, object_name: str, expiry_seconds: Optional[int] = None) -> Optional[str]:
     """Return a temporary, directly-downloadable URL for an object, or
-    None if MinIO isn't reachable (the caller can fall back to proxying
-    the download through the backend instead)."""
-    client = get_client()
+    None if object storage is unavailable/unreachable (the caller can fall
+    back to proxying the download through the backend instead)."""
     try:
+        client = get_client()
         return client.presigned_get_object(
             bucket,
             object_name,

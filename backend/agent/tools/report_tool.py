@@ -40,8 +40,14 @@ class ReportTool:
         self._get_active = active_document_provider or (lambda: None)
         self._set_active = active_document_setter or (lambda _f: None)
 
-    def run(self, context: ExecutionContext, document: Optional[str] = None) -> ExecutionContext:
+    def run(
+        self, context: ExecutionContext, document: Optional[str] = None, topic: Optional[str] = None
+    ) -> ExecutionContext:
         is_ar = context.language == "ar"
+        topic = (topic or "").strip()
+
+        if topic:
+            return self._run_topic_report(context, topic=topic, document=document, is_ar=is_ar)
 
         try:
             files = rag_service.list_stored_files()
@@ -120,6 +126,71 @@ class ReportTool:
             f"successfully. You can download it below."
         )
         context.observations.append({"tool": "report", "status": "generated", "document": target})
+
+        return context
+
+    def _run_topic_report(
+        self, context: ExecutionContext, topic: str, document: Optional[str], is_ar: bool
+    ) -> ExecutionContext:
+        """
+        Topic-scoped report path: searches all uploaded knowledge for
+        `topic` (or, if `document` was also named, within that one document
+        only) instead of summarizing one whole document end to end.
+        """
+        resolved_document: Optional[str] = None
+
+        if document:
+            try:
+                filenames = [f["filename"] for f in rag_service.list_stored_files()]
+            except Exception as e:
+                log.exception("Could not list stored files for topic report tool")
+                context.answer = (
+                    f"تعذّر الوصول إلى الملفات المخزّنة: {e}" if is_ar
+                    else f"Could not access stored files: {e}"
+                )
+                return context
+
+            resolved_document = self._fuzzy_match(document, filenames)
+            if resolved_document is None:
+                listing = "\n".join(f"- {name}" for name in filenames)
+                context.answer = (
+                    f"معنديش ملف اسمه '{document}'. الملفات المتاحة:\n\n{listing}"
+                    if is_ar else
+                    f"I couldn't find a document named '{document}'. Available files:\n\n{listing}"
+                )
+                return context
+
+        try:
+            result = report_service.generate_topic_report(topic, document=resolved_document)
+        except ValueError as e:
+            # Includes the "not enough information about this topic" case —
+            # surfaced as-is instead of generating a hallucinated report.
+            context.answer = str(e)
+            return context
+        except Exception as e:
+            log.exception("Topic report generation failed inside agent tool")
+            context.answer = (
+                f"حصل خطأ أثناء إنشاء التقرير عن '{topic}': {e}" if is_ar
+                else f"An error occurred while generating the report about '{topic}': {e}"
+            )
+            return context
+
+        if resolved_document:
+            self._set_active(resolved_document)
+
+        context.report = {
+            "filename": topic,
+            "object_name": result["object_name"],
+            "download_url": result["download_url"],
+            "proxy_download_path": f"/api/reports/{result['object_name']}/download",
+        }
+        context.answer = (
+            f"تم إنشاء تقرير احترافي شامل عن '{topic}' بنجاح. تقدر تنزّله من الرابط أدناه."
+            if is_ar else
+            f"A comprehensive professional report about '{topic}' has been generated "
+            f"successfully. You can download it below."
+        )
+        context.observations.append({"tool": "report", "status": "generated", "topic": topic})
 
         return context
 

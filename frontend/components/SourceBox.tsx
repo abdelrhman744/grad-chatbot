@@ -23,9 +23,10 @@ export default function SourceBox({ sources }: Props) {
           <span
             key={i}
             className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full
-              bg-ash text-ink text-xs font-medium border border-ash/80"
+              bg-surface-2 text-ink text-xs font-medium border border-border
+              hover:border-primary/40 hover:bg-surface-3 transition-colors"
           >
-            <svg className="w-3 h-3 text-muted flex-shrink-0" fill="none" viewBox="0 0 24 24"
+            <svg className="w-3 h-3 text-accent flex-shrink-0" fill="none" viewBox="0 0 24 24"
               stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round"
                 d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414A1 1 0 0119 9.414V19a2 2 0 01-2 2z"/>

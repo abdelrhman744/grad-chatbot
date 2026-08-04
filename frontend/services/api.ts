@@ -33,10 +33,15 @@ export interface StoredFile {
   download_url: string | null;
 }
 
-export interface UploadResponse {
-  message: string;
-  chunks_added: number;
+export type UploadStage = "queued" | "parsing" | "chunking" | "embedding" | "done";
+
+export interface UploadJobStatus {
+  job_id: string;
+  status: "queued" | "processing" | "done" | "error";
+  stage: UploadStage;
+  chunks_added?: number;
   stored_files?: StoredFile[];
+  error?: string;
 }
 
 export interface ReportResponse {
@@ -133,7 +138,13 @@ export async function resetConversation(): Promise<void> {
   await apiFetch("/chat/reset", { method: "POST" });
 }
 
-export async function uploadFiles(files: File[]): Promise<UploadResponse> {
+const UPLOAD_POLL_INTERVAL_MS = 1000;
+// Generous cap so even a very large/slow ingestion isn't abandoned
+// prematurely — this only bounds the polling loop, not the backend job
+// itself (which keeps running regardless).
+const UPLOAD_POLL_TIMEOUT_MS = 15 * 60_000;
+
+async function startUploadJob(files: File[]): Promise<{ job_id: string }> {
   const form = new FormData();
   files.forEach((f) => form.append("files", f));
 
@@ -143,6 +154,50 @@ export async function uploadFiles(files: File[]): Promise<UploadResponse> {
   });
 
   return res.json();
+}
+
+async function getUploadJobStatus(jobId: string): Promise<UploadJobStatus> {
+  const res = await apiFetch(`/upload/status/${jobId}`);
+  return res.json();
+}
+
+/**
+ * Starts an upload job (returns almost immediately — the heavy parse ->
+ * chunk -> embed -> index pipeline runs in the background) then polls its
+ * status until it reaches "done" or "error", invoking `onStage` on every
+ * stage change so the caller can show real progress instead of a single
+ * opaque spinner for the whole ingestion duration.
+ */
+export async function uploadFiles(
+  files: File[],
+  onStage?: (stage: UploadStage) => void
+): Promise<UploadJobStatus> {
+  const { job_id } = await startUploadJob(files);
+
+  const deadline = Date.now() + UPLOAD_POLL_TIMEOUT_MS;
+  let lastStage: UploadStage | null = null;
+
+  while (true) {
+    const status = await getUploadJobStatus(job_id);
+
+    if (status.stage !== lastStage) {
+      lastStage = status.stage;
+      onStage?.(status.stage);
+    }
+
+    if (status.status === "done" || status.status === "error") {
+      return status;
+    }
+
+    if (Date.now() > deadline) {
+      throw new Error(
+        "This upload is taking longer than expected. It's likely still " +
+          "processing in the background — check the document list again in a bit."
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, UPLOAD_POLL_INTERVAL_MS));
+  }
 }
 
 export async function checkHealth(): Promise<boolean> {

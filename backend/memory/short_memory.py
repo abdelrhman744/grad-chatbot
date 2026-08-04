@@ -12,13 +12,18 @@ from __future__ import annotations
 
 
 class ShortMemory:
-    def __init__(self, max_messages: int = 25):
+    def __init__(self, max_messages: int = 25, max_chars: int | None = None):
         """
         Args:
             max_messages: Maximum number of messages before summarization
                 is triggered by MemoryManager.
+            max_chars: Optional total-character budget across all buffered
+                messages. Summarization triggers on whichever limit is hit
+                first, so a handful of very long messages can't silently
+                balloon token usage before the message-count threshold fires.
         """
         self.max_messages = max_messages
+        self.max_chars = max_chars
         self.messages: list[dict] = []
 
     def add_message(self, role: str, content: str) -> None:
@@ -31,8 +36,15 @@ class ShortMemory:
     def count(self) -> int:
         return len(self.messages)
 
+    def total_chars(self) -> int:
+        return sum(len(m["content"]) for m in self.messages)
+
     def should_summarize(self) -> bool:
-        return len(self.messages) > self.max_messages
+        if len(self.messages) > self.max_messages:
+            return True
+        if self.max_chars is not None and self.total_chars() > self.max_chars:
+            return True
+        return False
 
     def clear(self) -> None:
         self.messages.clear()

@@ -6,7 +6,7 @@ backend/.venv/
 
 # Environment
 backend/.env
-
+backend/.env.example
 # Node
 frontend/node_modules/
 frontend/.next/

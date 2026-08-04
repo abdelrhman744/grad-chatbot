@@ -85,9 +85,9 @@ export default function VoiceRecorder({ onResult, disabled }: Props) {
           type="button"
           onClick={start}
           disabled={disabled}
-          className="h-10 px-3 rounded-xl border border-ash bg-white text-ink
+          className="h-10 px-3 rounded-xl border border-border bg-surface-2 text-ink shadow-card
             flex items-center gap-2 text-sm font-medium
-            hover:bg-ash/70 disabled:opacity-40 disabled:cursor-not-allowed
+            hover:border-primary/40 hover:shadow-hover disabled:opacity-40 disabled:cursor-not-allowed
             transition-all flex-shrink-0"
         >
           <Mic className="w-4 h-4" />
@@ -99,10 +99,14 @@ export default function VoiceRecorder({ onResult, disabled }: Props) {
         <button
           type="button"
           onClick={stop}
-          className="h-10 px-3 rounded-xl bg-accent text-white
+          className="h-10 px-3 rounded-xl bg-danger text-white shadow-[0_0_16px_rgba(239,68,68,0.4)]
             flex items-center gap-2 text-sm font-medium
-            hover:bg-accent/90 transition-all flex-shrink-0"
+            hover:bg-danger/90 transition-all flex-shrink-0"
         >
+          <span className="relative flex h-2 w-2">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75" />
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-white" />
+          </span>
           <Square className="w-4 h-4" />
           <span>Stop {fmt(seconds)}</span>
         </button>
@@ -110,10 +114,10 @@ export default function VoiceRecorder({ onResult, disabled }: Props) {
 
       {state === "processing" && (
         <div
-          className="h-10 px-3 rounded-xl border border-ash bg-white text-muted
+          className="h-10 px-3 rounded-xl border border-border bg-surface-2 text-muted
           flex items-center gap-2 text-sm font-medium flex-shrink-0"
         >
-          <Loader2 className="w-4 h-4 animate-spin" />
+          <Loader2 className="w-4 h-4 animate-spin text-primary" />
           <span className="hidden sm:inline">Transcribing</span>
         </div>
       )}

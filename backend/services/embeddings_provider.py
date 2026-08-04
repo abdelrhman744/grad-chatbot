@@ -39,6 +39,8 @@ from typing import List, Optional
 from langchain_core.embeddings import Embeddings
 
 from config import settings
+from utils import timing
+from utils.device import resolve_device
 
 log = logging.getLogger("embeddings_provider")
 
@@ -52,17 +54,25 @@ class LocalEmbeddings(Embeddings):
     def __init__(self, model_name: str):
         from sentence_transformers import SentenceTransformer
 
-        log.info(f"Loading local embedding model '{model_name}' (one-time load)...")
-        self._model = SentenceTransformer(model_name)
+        device = resolve_device()
+        log.info(f"Loading local embedding model '{model_name}' on device={device!r} (one-time load)...")
+        self._model = SentenceTransformer(model_name, device=device)
         self.model_name = model_name
-        log.info(f"Embedding model '{model_name}' loaded and ready.")
+        log.info(f"Embedding model '{model_name}' loaded and ready on {device!r}.")
 
     def _encode(self, texts: List[str]) -> List[List[float]]:
-        vectors = self._model.encode(
-            texts,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        )
+        # Cumulative compute time across every embed call in the request
+        # (query embeddings for each retrieval variant, document embeddings
+        # for MMR diversification, ...). Recorded as a substage — see
+        # utils/timing.py — since these calls run concurrently across
+        # threads inside a wider "embedding_and_qdrant_retrieval" stage, so
+        # summing their durations is CPU-time, not wall-time.
+        with timing.substage("embedding_model_compute"):
+            vectors = self._model.encode(
+                texts,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )
         return vectors.tolist()
 
     # ── langchain-compatible Embeddings interface ──────────────────────────
@@ -74,6 +84,23 @@ class LocalEmbeddings(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         """Embed a single user query for similarity search against Qdrant."""
         return self._encode([f"query: {text}"])[0]
+
+    def embed_queries(self, texts: List[str]) -> List[List[float]]:
+        """
+        Batched counterpart of embed_query: embed several query strings
+        (e.g. every retrieval query variant) in ONE forward pass instead of
+        one call each. Firing N separate embed_query() calls concurrently
+        across threads (the previous retrieval pattern) is fine on CPU
+        (independent cores) but actively hurts on GPU — a single device
+        processes concurrently-submitted small calls with far more
+        per-call overhead than one batched call of the same total size
+        (measured ~10x slower for 9 single-item concurrent GPU calls vs.
+        one batched call of the same 9 texts — see PROFILING.md). Batching
+        here is a straight win on both CPU and GPU.
+        """
+        if not texts:
+            return []
+        return self._encode([f"query: {t}" for t in texts])
 
 
 # ── Shared singleton ─────────────────────────────────────────────────────────

@@ -22,6 +22,8 @@ from memory.memory_manager import MemoryManager
 from services import rag_service
 from services.rag_service import detect_language, build_sources_from_dicts
 
+from utils import timing
+
 from .llm import AgentLLM
 from .prompt import SYSTEM_PROMPT, USER_PROMPT
 from .registry import build_tools
@@ -75,12 +77,15 @@ class Agent:
     # ── Public API ───────────────────────────────────────────────────────
 
     def run(self, question: str, language: str = "auto", debug: bool = False) -> ExecutionContext:
-        detected_lang = detect_language(question) if language == "auto" else language
+        with timing.stage("language_detection"):
+            detected_lang = detect_language(question) if language == "auto" else language
         context = ExecutionContext(language=detected_lang)
 
         for iteration in range(self.max_iterations):
             messages = self._build_messages(question, context)
-            action = self.llm.invoke(messages, fallback_question=question)
+            with timing.stage("agent_planning"):
+                action = self.llm.invoke(messages, fallback_question=question)
+                action = self._correct_premature_terminal(messages, action, context, question)
 
             if debug or settings.AGENT_DEBUG:
                 self._debug_step(iteration + 1, action)
@@ -141,6 +146,7 @@ class Agent:
         for iteration in range(self.max_iterations):
             messages = self._build_messages(question, context)
             action = self.llm.invoke(messages, fallback_question=question)
+            action = self._correct_premature_terminal(messages, action, context, question)
 
             if settings.AGENT_DEBUG:
                 self._debug_step(iteration + 1, action)
@@ -264,13 +270,16 @@ class Agent:
     # ── Internal ─────────────────────────────────────────────────────────
 
     def _build_messages(self, question: str, context: ExecutionContext) -> list[dict]:
+        with timing.stage("memory_loading"):
+            memory_text = self.memory_manager.as_prompt_text() or "(none)"
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": USER_PROMPT.format(
                     question=question,
-                    memory=self.memory_manager.as_prompt_text() or "(none)",
+                    active_document=self.active_document or "(none)",
+                    memory=memory_text,
                     documents=len(context.documents),
                     observations=self._format_observations(context.observations),
                     retrieved_questions=", ".join(context.retrieved_questions) or "(none)",
@@ -288,10 +297,59 @@ class Agent:
         tool = self.tools[action.action.value]
         return tool.run(context=context, **action.arguments.model_dump())
 
+    def _correct_premature_terminal(self, messages: list[dict], action, context: ExecutionContext, question: str):
+        """
+        Deterministic backstop for a routing mistake the planner makes
+        intermittently (confirmed via direct testing — see Issue 2
+        investigation): choosing "respond" or "generate" WITHOUT ever
+        calling "retrieve" this turn, for a message that plainly asks for
+        document content (most often reproduced with short, imperative
+        phrasings, e.g. Arabic "اشرح لي X" / English "Explain X" — no
+        question mark, and easy for the small, low-latency AGENT_MODEL to
+        misclassify as small talk despite the system prompt's explicit
+        "HARD RULE" against it). Same exact input, temperature 0, has been
+        observed to occasionally choose "retrieve" and occasionally not —
+        hosted LLM inference is not perfectly reproducible run-to-run — so
+        prompting alone cannot guarantee the rule; this enforces it in code.
+
+        Only fires once per turn, only when nothing has been retrieved yet
+        (mirrors the prompt's own stated exception for genuine greetings/
+        small talk/meta-conversation, which should still legitimately
+        confirm "respond" on the second ask). Never forces "retrieve" —
+        it only asks the planner to re-examine its own rule and accepts
+        whatever it says the second time, so a real greeting is unaffected.
+        """
+        if action.action not in (ToolName.RESPOND, ToolName.GENERATE):
+            return action
+        if context.retrieved_questions or context.documents:
+            return action
+
+        log.warning(
+            f"Agent chose '{action.action.value}' on iteration 1 with nothing retrieved yet "
+            f"for question={question!r} — re-asking once per the prompt's own HARD RULE."
+        )
+        corrective_messages = messages + [
+            {
+                "role": "user",
+                "content": (
+                    f"You chose \"{action.action.value}\" but no \"retrieve\" call has been made "
+                    "this turn yet. Per the HARD RULE: this is only correct if the user's message "
+                    "is PURELY a greeting, thanks, farewell, or a question about the conversation "
+                    "itself. Re-read the user's message carefully — including short commands like "
+                    "\"explain X\" / \"اشرح لي X\" / \"وضح X\", which ARE information requests, not "
+                    "small talk. If it asks for any fact, definition, or explanation, choose "
+                    "\"retrieve\" instead. If it is genuinely pure greeting/small talk/meta-"
+                    "conversation, choose \"respond\" again."
+                ),
+            }
+        ]
+        return self.llm.invoke(corrective_messages, fallback_question=question)
+
     def _remember(self, question: str, context: ExecutionContext) -> None:
         answer = context.final_answer()
         if answer:
-            self.memory_manager.add_turn(user_message=question, assistant_message=answer)
+            with timing.stage("memory_persist"):
+                self.memory_manager.add_turn(user_message=question, assistant_message=answer)
 
     def _debug_step(self, iteration: int, action) -> None:
         log.debug(f"--- iteration {iteration} ---")

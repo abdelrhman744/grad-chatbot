@@ -1,12 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Globe2, Languages, Loader2, SendHorizontal, Mic2 } from "lucide-react";
+import { Globe2, Languages, Loader2, SendHorizontal, Sparkles, AlertTriangle } from "lucide-react";
 import { askVoice, resetConversation, streamChat, ChatResponse, ReportInfo } from "@/services/api";
 import AnswerBox from "./AnswerBox";
 import SourceBox from "./SourceBox";
 import ReportCard from "./ReportCard";
 import VoiceRecorder from "./VoiceRecorder";
+import EmptyState from "@/components/ui/EmptyState";
 
 type Language = "auto" | "ar" | "en";
 
@@ -19,13 +20,14 @@ interface Message {
   loading?: boolean;
   statusText?: string;
   report?: ReportInfo | null;
+  isError?: boolean;
 }
 
 interface Props {
   resetSignal?: number;
 }
 
-const isArabicText = (text: string) => /[\u0600-\u06FF]/.test(text);
+const isArabicText = (text: string) => /[؀-ۿ]/.test(text);
 
 export default function ChatBox({ resetSignal }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -113,9 +115,10 @@ export default function ChatBox({ resetSignal }: Props) {
         m.id === aiId
           ? {
               ...m,
-              text: `Error: ${err}`,
+              text: err,
               loading: false,
               statusText: undefined,
+              isError: true,
             }
           : m
       )
@@ -192,46 +195,42 @@ export default function ChatBox({ resetSignal }: Props) {
 
   return (
     <div className="flex flex-col h-full" dir="ltr">
-      <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6">
+      <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6 space-y-6">
         {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full gap-4 text-center py-20">
-            <div className="w-16 h-16 rounded-2xl bg-ash flex items-center justify-center">
-              <Mic2 className="w-8 h-8 text-muted" />
-            </div>
-
-            <div>
-              <p className="text-lg font-medium text-ink">
-                Ask about your documents
-              </p>
-              <p className="text-sm text-muted mt-1">
-                Upload files first, then ask anything
-              </p>
-            </div>
+          <div className="flex flex-col items-center justify-center h-full">
+            <EmptyState
+              icon={Sparkles}
+              title="Ask about your documents"
+              subtitle="Upload files in the sidebar, then ask anything — I'll search your knowledge base for grounded answers."
+              className="py-20"
+            />
           </div>
         )}
 
-        {messages.map((msg) => {
+        {messages.map((msg, idx) => {
           const isUser = msg.role === "user";
           const isAr = isArabicText(msg.text);
+          const isLastMessage = idx === messages.length - 1;
+          const isStreaming = submitting && isLastMessage && !isUser && !msg.isError;
 
           return (
             <div
               key={msg.id}
-              className={`flex w-full ${
+              className={`flex w-full animate-fade-up ${
                 isUser ? "justify-end" : "justify-start"
               }`}
             >
               <div
                 className={`
-                  max-w-[75%] flex flex-col gap-1.5
+                  max-w-[85%] sm:max-w-[75%] flex flex-col gap-1.5
                   ${isUser ? "items-end" : "items-start"}
                 `}
               >
                 {isUser ? (
                   <div
                     className={`
-                      px-4 py-3 rounded-2xl rounded-br-sm
-                      bg-ink text-paper shadow-sm
+                      px-4 py-3 rounded-2xl rounded-br-md
+                      bg-gradient-primary text-white shadow-card
                       text-[15px] leading-relaxed whitespace-pre-wrap
                       ${isAr ? "text-right font-arabic" : "text-left"}
                     `}
@@ -239,9 +238,23 @@ export default function ChatBox({ resetSignal }: Props) {
                   >
                     {msg.text}
                   </div>
+                ) : msg.isError ? (
+                  <div
+                    className="flex items-start gap-2.5 px-4 py-3 rounded-2xl rounded-bl-md
+                      bg-danger/10 border border-danger/30 text-danger
+                      text-sm leading-relaxed max-w-full animate-fade-up"
+                  >
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    <span>{msg.text}</span>
+                  </div>
                 ) : (
                   <>
-                    <AnswerBox text={msg.text} isLoading={!!msg.loading} statusText={msg.statusText} />
+                    <AnswerBox
+                      text={msg.text}
+                      isLoading={!!msg.loading}
+                      statusText={msg.statusText}
+                      streaming={isStreaming}
+                    />
                     {msg.sources && <SourceBox sources={msg.sources} />}
                     {msg.report && <ReportCard report={msg.report} isArabic={isArabicText(msg.text)} />}
                   </>
@@ -254,8 +267,8 @@ export default function ChatBox({ resetSignal }: Props) {
         <div ref={bottomRef} />
       </div>
 
-      <div className="border-t border-ash bg-paper/95 backdrop-blur-sm px-4 py-4">
-        <div className="flex gap-1 mb-3 justify-start">
+      <div className="border-t border-border glass px-4 sm:px-6 py-4">
+        <div className="flex gap-1.5 mb-3 justify-start">
           {LANG_OPTIONS.map((opt) => {
             const Icon = opt.icon;
 
@@ -267,8 +280,8 @@ export default function ChatBox({ resetSignal }: Props) {
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all
                   ${
                     language === opt.value
-                      ? "bg-ink text-paper shadow-sm"
-                      : "bg-ash text-muted hover:text-ink hover:bg-ash/80"
+                      ? "bg-gradient-primary text-white shadow-sm"
+                      : "bg-surface-2 text-muted hover:text-ink hover:bg-surface-3"
                   }`}
               >
                 <Icon className="w-3.5 h-3.5" />
@@ -297,10 +310,11 @@ export default function ChatBox({ resetSignal }: Props) {
               placeholder="Ask a question about your documents... (Enter to send)"
               rows={1}
               className={`
-                w-full resize-none rounded-xl border border-ash bg-white
+                w-full resize-none rounded-xl border border-border bg-surface-2
                 px-4 py-3 text-[15px] leading-relaxed text-ink
-                placeholder-muted outline-none
-                focus:border-teal focus:ring-2 focus:ring-teal/20
+                placeholder-subtle outline-none shadow-card
+                transition-all
+                focus:border-primary/60 focus:ring-2 focus:ring-primary/20
                 disabled:opacity-50
                 max-h-40 overflow-y-auto
                 ${isArabicText(query) ? "text-right font-arabic" : "text-left"}
@@ -312,8 +326,8 @@ export default function ChatBox({ resetSignal }: Props) {
           <button
             type="submit"
             disabled={!query.trim() || submitting}
-            className="w-10 h-10 rounded-xl bg-ink text-paper flex items-center justify-center
-              hover:bg-ink/80 disabled:opacity-40 disabled:cursor-not-allowed
+            className="w-10 h-10 rounded-xl bg-gradient-primary text-white flex items-center justify-center
+              hover:shadow-glow disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none
               transition-all flex-shrink-0"
           >
             {submitting ? (

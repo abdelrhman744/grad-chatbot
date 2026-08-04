@@ -9,6 +9,15 @@ langchain-community
 langchain-qdrant
 langchain-text-splitters
 sentence-transformers
+# `pip install -r requirements.txt` installs the default CPU-only torch
+# build, which works everywhere with no extra setup. To use a CUDA GPU
+# instead (see EMBEDDING_DEVICE in .env.example — auto-detected, falls
+# back to CPU on its own), install a CUDA build for your driver INSTEAD,
+# e.g.:
+#   pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.13.0
+# (pick the cuXXX tag matching your NVIDIA driver: see
+# https://pytorch.org/get-started/locally/). No code or config changes are
+# needed beyond that — EMBEDDING_DEVICE=auto (the default) picks it up.
 torch
 groq
 opencv-python
@@ -19,6 +28,11 @@ numpy
 pillow
 docx2txt
 pypdf
+
+# Excel/CSV ingestion
+pandas>=2.0
+openpyxl>=3.1
+xlrd>=2.0,<3.0
 
 # MinIO object storage (uploaded files)
 minio

@@ -42,8 +42,9 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import arabic_reshaper
 from bidi.algorithm import get_display
@@ -68,13 +69,21 @@ from reportlab.platypus.tableofcontents import TableOfContents
 from config import settings
 from services import storage_service
 from services.llm_provider import get_llm
-from services.rag_service import detect_language, get_document_pages
+from services.rag_service import detect_language, get_document_pages, retrieve
 
 log = logging.getLogger("report_service")
 
 llm = get_llm()
 
 MAX_DIGEST_CHARS = 14000  # cap on how much aggregated-fact text feeds each reduce call
+MAP_EXTRACT_CONCURRENCY = 5  # bounded worker pool for the per-slice MAP step
+# A report needs broad topical coverage, not just the single best chat-style
+# match — pull more chunks than a normal chat retrieve() call would.
+TOPIC_REPORT_TOP_K = 24
+# Of those candidates, drop any scoring below this fraction of the best
+# match's score — otherwise a broad top_k pulls in unrelated documents just
+# to fill the quota instead of reflecting only genuinely relevant material.
+TOPIC_REPORT_RELEVANCE_RATIO = 0.5
 
 
 # ── Arabic-capable fonts ─────────────────────────────────────────────────────
@@ -361,14 +370,39 @@ def build_report_data(filename: str) -> dict:
     raw_chunks = _chunk_pages(pages, settings.REPORT_MAP_CHUNK_CHARS)
     total = len(raw_chunks)
 
-    map_results = []
-    for i, chunk in enumerate(raw_chunks):
+    def _map_one(indexed_chunk) -> dict:
+        i, chunk = indexed_chunk
         extracted = _map_extract(chunk["text"], lang, i + 1, total)
         extracted["page_ref"] = _page_ref(chunk["page_start"], chunk["page_end"])
-        map_results.append(extracted)
+        return extracted
+
+    # Each slice's MAP-extract call only depends on that slice's own text —
+    # run them on a bounded worker pool instead of one Groq round-trip at a
+    # time. For a large document this was previously the single biggest
+    # contributor to report latency (~N sequential calls, N = slice count);
+    # it's now ~N / MAP_EXTRACT_CONCURRENCY. pool.map preserves input order,
+    # so section ordering in the final report is unaffected.
+    if total:
+        with ThreadPoolExecutor(max_workers=min(MAP_EXTRACT_CONCURRENCY, total)) as pool:
+            map_results = list(pool.map(_map_one, enumerate(raw_chunks)))
+    else:
+        map_results = []
 
     aggregated = _aggregate(map_results)
     digest = _digest(map_results)
+
+    # The 4 REDUCE narrative sections share the same digest/aggregated
+    # input and only differ by which section they're writing — independent
+    # calls, so run them concurrently too instead of 4 sequential ones.
+    narrative_kinds = ["executive_summary", "introduction", "relationships", "conclusion"]
+    with ThreadPoolExecutor(max_workers=len(narrative_kinds)) as pool:
+        narratives = dict(zip(
+            narrative_kinds,
+            pool.map(
+                lambda kind: _reduce_narrative(digest, aggregated, filename, lang, kind),
+                narrative_kinds,
+            ),
+        ))
 
     return {
         "filename": filename,
@@ -384,10 +418,160 @@ def build_report_data(filename: str) -> dict:
             }
             for r in map_results
         ],
-        "executive_summary": _reduce_narrative(digest, aggregated, filename, lang, "executive_summary"),
-        "introduction": _reduce_narrative(digest, aggregated, filename, lang, "introduction"),
-        "relationships": _reduce_narrative(digest, aggregated, filename, lang, "relationships"),
-        "conclusion": _reduce_narrative(digest, aggregated, filename, lang, "conclusion"),
+        "executive_summary": narratives["executive_summary"],
+        "introduction": narratives["introduction"],
+        "relationships": narratives["relationships"],
+        "conclusion": narratives["conclusion"],
+        **aggregated,
+    }
+
+
+def _topic_is_covered(topic: str, chunks: List[dict], lang: str) -> bool:
+    """
+    LLM relevance gate for topic-scoped reports: does the retrieved
+    material actually contain information about `topic`, or is it just the
+    least-irrelevant match retrieval could find? See the call site in
+    build_topic_report_data() for why a lexical/embedding score threshold
+    alone isn't trusted for this decision.
+    """
+    sample = "\n\n".join(c["text"][:500] for c in chunks[:6])
+
+    if lang == "ar":
+        prompt = f"""فيما يلي مقتطفات مسترجعة من مستندات مرفوعة، والموضوع المطلوب إنشاء تقرير عنه.
+هل تحتوي هذه المقتطفات فعليًا على معلومات ذات صلة مباشرة بالموضوع التالي؟ أجب بكلمة واحدة فقط: نعم أو لا.
+
+الموضوع: {topic}
+
+المقتطفات:
+{sample}"""
+    else:
+        prompt = f"""Below are excerpts retrieved from uploaded documents, and a topic requested for a report.
+Do these excerpts actually contain information directly relevant to the topic below? Answer with exactly one word: yes or no.
+
+Topic: {topic}
+
+Excerpts:
+{sample}"""
+
+    try:
+        out = str(llm.invoke(prompt)).strip().lower()
+        return out.startswith(("yes", "نعم"))
+    except Exception as e:
+        log.warning(f"[report] topic relevance check failed, assuming relevant: {e}")
+        return True  # fail open — a transient LLM error shouldn't block a report
+
+
+def build_topic_report_data(topic: str, document: Optional[str] = None) -> dict:
+    """
+    Topic-scoped counterpart to build_report_data(): instead of re-reading
+    one whole document end to end, retrieve the chunks most relevant to
+    `topic` — across the entire uploaded knowledge base, or within
+    `document` only if one was named — and run the same MAP/REDUCE pipeline
+    over the retrieved chunk text instead of over whole-document pages.
+
+    Raises ValueError if too little relevant material is found, so the
+    caller can tell the user that plainly instead of generating a report
+    from unrelated or insufficient content.
+    """
+    topic = (topic or "").strip()
+    if not topic:
+        raise ValueError("No topic was given to build a report from.")
+
+    lang = detect_language(topic)
+
+    chunks = retrieve(topic, lang=lang, top_k=TOPIC_REPORT_TOP_K, source_filter=document)
+
+    # retrieve() with a large top_k returns its best top_k candidates
+    # regardless of whether that many are genuinely relevant — for a chat
+    # answer (top_k~5) that's rarely visible, but at TOPIC_REPORT_TOP_K it
+    # would otherwise pad the report with barely-related chunks from
+    # unrelated documents just to fill the quota. Keep only chunks scoring
+    # reasonably close to the best match found for this topic.
+    if chunks:
+        top_score = max(c["metadata"].get("relevance_score", 0.0) for c in chunks)
+        min_score = max(top_score * TOPIC_REPORT_RELEVANCE_RATIO, settings.CONFIDENCE_THRESHOLD)
+        chunks = [c for c in chunks if c["metadata"].get("relevance_score", 0.0) >= min_score]
+
+    insufficient_msg = (
+        f"لم يتم العثور على معلومات كافية عن '{topic}' في المستندات المرفوعة."
+        if lang == "ar" else
+        f"Not enough information about '{topic}' was found in the uploaded documents."
+    )
+
+    if not chunks:
+        raise ValueError(insufficient_msg)
+
+    # The relevance-score filter above only trims obviously-weak padding; it
+    # cannot reliably tell "on-topic" from "the least-bad match among
+    # entirely unrelated documents" (the same limitation noted on
+    # CONFIDENCE_THRESHOLD in rag_service.py — lexical/embedding scores
+    # alone aren't a reliable topic classifier). Retrieval always returns
+    # *something* if the knowledge base isn't empty, even for a topic
+    # nothing covers. An explicit LLM relevance judgment is the real gate
+    # here, since — unlike a chat answer, where build_prompt()'s grounding
+    # rule lets the model decline per-question — nothing downstream in the
+    # report pipeline would otherwise refuse to write up unrelated content.
+    if not _topic_is_covered(topic, chunks, lang):
+        raise ValueError(insufficient_msg)
+
+    sources = sorted({c["metadata"].get("source", "?") for c in chunks})
+
+    # Reuse the same page-aware slicing build_report_data() uses, but keyed
+    # by retrieval rank instead of physical page order — retrieved chunks
+    # can come from different documents/pages entirely, so each chunk is
+    # its own "page" here, prefixed with its source filename so the MAP
+    # step (and a human skimming the PDF) can still tell where it came from.
+    pseudo_pages = [
+        {"page": i + 1, "text": f"[{c['metadata'].get('source', '?')}] {c['text']}"}
+        for i, c in enumerate(chunks)
+    ]
+    raw_chunks = _chunk_pages(pseudo_pages, settings.REPORT_MAP_CHUNK_CHARS)
+    total = len(raw_chunks)
+
+    def _map_one(indexed_chunk) -> dict:
+        i, chunk = indexed_chunk
+        extracted = _map_extract(chunk["text"], lang, i + 1, total)
+        extracted["page_ref"] = _page_ref(chunk["page_start"], chunk["page_end"])
+        return extracted
+
+    if total:
+        with ThreadPoolExecutor(max_workers=min(MAP_EXTRACT_CONCURRENCY, total)) as pool:
+            map_results = list(pool.map(_map_one, enumerate(raw_chunks)))
+    else:
+        map_results = []
+
+    aggregated = _aggregate(map_results)
+    digest = _digest(map_results)
+
+    narrative_kinds = ["executive_summary", "introduction", "relationships", "conclusion"]
+    with ThreadPoolExecutor(max_workers=len(narrative_kinds)) as pool:
+        narratives = dict(zip(
+            narrative_kinds,
+            pool.map(
+                lambda kind: _reduce_narrative(digest, aggregated, topic, lang, kind),
+                narrative_kinds,
+            ),
+        ))
+
+    return {
+        "filename": topic,
+        "sources": sources,
+        "language": lang,
+        "page_count": total,
+        "section_count": total,
+        "sections": [
+            {
+                "title": r["section_title"],
+                "page_ref": r["page_ref"],
+                "summary": r["summary"],
+                "key_points": r["key_points"],
+            }
+            for r in map_results
+        ],
+        "executive_summary": narratives["executive_summary"],
+        "introduction": narratives["introduction"],
+        "relationships": narratives["relationships"],
+        "conclusion": narratives["conclusion"],
         **aggregated,
     }
 
@@ -542,7 +726,12 @@ def render_report_pdf(data: dict) -> bytes:
     story.append(Spacer(1, 1 * cm))
     story.append(HRFlowable(width="60%", color=colors.HexColor("#0f766e"), thickness=1.2, hAlign="CENTER"))
     story.append(Spacer(1, 0.6 * cm))
-    story.append(_p(f"{labels['source_doc']}: {filename}", styles["cover_meta"], lang))
+    # Topic-scoped reports (build_topic_report_data) set "sources" to the
+    # list of contributing filenames; whole-document reports don't set it,
+    # so this falls back to the single filename exactly as before.
+    contributing_sources = data.get("sources") or [filename]
+    source_line = ", ".join(contributing_sources) if len(contributing_sources) > 1 else filename
+    story.append(_p(f"{labels['source_doc']}: {source_line}", styles["cover_meta"], lang))
     story.append(_p(f"{labels['generated']}: {time.strftime('%Y-%m-%d %H:%M UTC')}", styles["cover_meta"], lang))
     story.append(_p(f"{labels['pages']}: {data.get('page_count', '?')}  |  {labels['sections']}: {data.get('section_count', '?')}", styles["cover_meta"], lang))
     story.append(PageBreak())
@@ -619,7 +808,7 @@ def render_report_pdf(data: dict) -> bytes:
     body(data.get("conclusion", ""))
 
     heading(labels["references"])
-    body(f"{labels['source_doc']}: {filename}")
+    body(f"{labels['source_doc']}: {source_line}")
     body(labels["ref_note"])
 
     doc.multiBuild(story)
@@ -633,6 +822,12 @@ def _report_object_name(filename: str) -> str:
     return f"{stem}_report.pdf"
 
 
+def _topic_report_object_name(topic: str) -> str:
+    slug = re.sub(r"\s+", "_", topic.strip())
+    slug = re.sub(r'[<>:"/\\|?*]', "_", slug)[:80].strip("_") or "topic"
+    return f"{slug}_report.pdf"
+
+
 def generate_report(filename: str) -> dict:
     """
     Generate (or regenerate) the comprehensive PDF report for `filename`,
@@ -642,6 +837,30 @@ def generate_report(filename: str) -> dict:
     pdf_bytes = render_report_pdf(data)
 
     object_name = _report_object_name(filename)
+    storage_service.upload_bytes(
+        settings.MINIO_BUCKET_REPORTS, object_name, pdf_bytes, content_type="application/pdf"
+    )
+
+    return {
+        "object_name": object_name,
+        "download_url": storage_service.presigned_url(settings.MINIO_BUCKET_REPORTS, object_name),
+        "language": data["language"],
+    }
+
+
+def generate_topic_report(topic: str, document: Optional[str] = None) -> dict:
+    """
+    Generate a topic-scoped PDF report: retrieves the material most
+    relevant to `topic` (across all uploaded documents, or within
+    `document` only if given) and reuses the same MAP/REDUCE/PDF pipeline
+    as generate_report(). Raises ValueError if too little relevant
+    material was found for the topic — the caller (ReportTool) surfaces
+    that as a plain "not enough information" answer instead of a report.
+    """
+    data = build_topic_report_data(topic, document=document)
+    pdf_bytes = render_report_pdf(data)
+
+    object_name = _topic_report_object_name(topic)
     storage_service.upload_bytes(
         settings.MINIO_BUCKET_REPORTS, object_name, pdf_bytes, content_type="application/pdf"
     )

@@ -4,10 +4,69 @@ An **agentic, bilingual (Arabic/English) Retrieval-Augmented Generation system**
 for chatting with your own documents — LLM generation via the **Groq API**,
 local **Qdrant** vector storage, and a configurable embeddings provider.
 
-Upload PDFs, Word docs, text, JSON, or scanned images; ask questions by typing
-or by voice; get grounded, cited answers from an autonomous agent that decides
-for itself when to search your documents, when to rely on conversation memory,
-and when to summarize or compare what it has found.
+Upload PDFs, Word docs, Excel spreadsheets/CSVs, text, JSON, or scanned
+images; ask questions by typing or by voice; get grounded, cited answers
+from an autonomous agent that decides for itself when to search your
+documents, when to rely on conversation memory, and when to summarize or
+compare what it has found.
+
+---
+
+## What's New: Excel/CSV Ingestion, Modular Loaders, Redesigned UI
+
+- 📊 **Excel/CSV ingestion** — `.xlsx`, `.xls`, and `.csv` files are now
+  first-class citizens alongside PDFs. Every sheet is read (via pandas),
+  turned into a sheet-summary chunk plus row-group chunks, tagged with
+  `sheet_name` metadata, and stored/queried exactly like any other document.
+  See `backend/loaders/excel_loader.py`.
+- 🧩 **Modular loaders package** — per-file-type parsing (PDF, DOCX, TXT/MD,
+  JSON, images, Excel) now lives in `backend/loaders/`, one module per type,
+  dispatched through a single `loaders/registry.py` — no more inline
+  if/elif branching in `rag_service.py`.
+- 🎨 **Redesigned frontend** — refreshed cards, file-type badges, skeleton
+  loaders, empty states, and upload progress, built on the existing design
+  tokens. All backend-technology names (Groq, Qdrant, Whisper, etc.) have
+  been removed from user-facing UI text.
+
+### Previous round: Smarter Planner, Structured Memory, Better Retrieval
+
+A five-part upgrade to the agent's reasoning and retrieval quality:
+
+- 🧭 **Semantic intent recognition & coreference resolution** — the planner
+  now recognises comparison/evaluation intent from natural phrasing ("which
+  one is better?", "what changed?", "pros and cons?") instead of needing the
+  literal word "compare", and resolves implicit references ("the two
+  methods", "this document", "it") using the conversation's active document
+  and memory instead of asking the user to repeat themselves. See
+  `backend/agent/prompt.py` (Semantic Intent Recognition / Reference &
+  Coreference Resolution sections) and `backend/agent/agent.py`.
+- 🌐 **Deeper cross-language query expansion** — same-language synonym
+  rephrasing and concept-level expansion (e.g. "advantages" → "benefits")
+  now run on the user's original-language query, not just on translated
+  variants, so evaluative/semantic questions match document wording that
+  doesn't share the user's exact vocabulary. See `_concept_expand()` /
+  `_query_variants()` in `backend/services/rag_service.py`.
+- 🧠 **Structured long-term memory** — long-term memory is now a capped,
+  deduplicated store of discrete facts (with category + importance) instead
+  of one free-text paragraph rewritten from scratch each time. Near-duplicate
+  facts are merged in code (not left to LLM instruction-following), the
+  fewest-important/oldest facts are evicted once the cap is hit, and
+  rendering is truncated to a character budget — bounding token usage
+  regardless of conversation length. Old pre-upgrade summary files still
+  load correctly (migrated into a single legacy fact). See
+  `backend/memory/summary_memory.py`, `backend/memory/fact_extractor.py`.
+- 🔎 **Cross-encoder reranking + diversity selection + context budgeting** —
+  retrieval now blends a semantic cross-encoder relevance score with the
+  existing lexical/bigram score (falling back to lexical-only if the model
+  can't load), reselects the final chunk set for diversity (MMR-lite) so
+  near-duplicate chunks don't crowd out distinct information, and trims
+  context to a character budget so prompt size stays bounded. See `_rerank`,
+  `_diversify`, `_trim_to_budget` in `backend/services/rag_service.py`.
+- ✂️ **Concise-by-default answers** — answers are no longer forced into a
+  fixed "Explanation:/Example:" shape with an example every time; the model
+  now matches answer length to question complexity and only adds an example
+  when it genuinely aids understanding or was explicitly requested. See
+  `build_prompt()` in `backend/services/rag_service.py`.
 
 ---
 
@@ -62,6 +121,15 @@ cp backend/.env.example backend/.env
 cp frontend/.env.example frontend/.env.local   # optional, only if backend isn't on :8000
 ```
 
+> **MinIO is optional at runtime.** The backend still starts, and
+> upload/chat/retrieval/memory all still work, even if the `minio` package
+> isn't installed or the MinIO server isn't running — `GET /api/health`
+> reports `"minio": "unreachable"` in that case instead of crashing.
+> Without it, uploaded originals aren't stored (`download_url` comes back
+> `null` for those files) and PDF report generation/download return
+> `503 Service Unavailable`, since both need the original file bytes.
+> Run `docker compose up -d` and restart the backend to enable them.
+
 No extra setup is needed for streaming — `/ws/chat` is served by the same
 FastAPI app as the REST routes.
 
@@ -95,25 +163,41 @@ speech-to-text, and Tesseract/OpenCV handle OCR on scanned PDFs and images.
 
 ## 2. Features
 
-- 📄 **Multi-format ingestion** — PDF, DOCX/DOC, TXT, Markdown, JSON, and
+- 📄 **Multi-format ingestion** — PDF, DOCX/DOC, TXT, Markdown, JSON, Excel
+  (XLSX/XLS/CSV — every sheet, with sheet-summary + row-group chunking), and
   images (JPG/PNG/TIFF/BMP/WEBP), with automatic OCR fallback for
-  scanned/text-light PDFs and pure image files.
-- 🌐 **Bilingual retrieval** — Arabic and English queries are normalized,
-  translated, spell-corrected, and rephrased into multiple retrieval
-  variants so cross-language and typo-heavy questions still find the right
-  chunks.
-- 🔎 **Hybrid retrieval** — vector similarity search followed by a lexical
-  reranking pass (keyword + bigram overlap) tuned for Arabic and English.
-- 🤖 **Agentic reasoning (ReAct loop)** — the agent chooses one action at a
-  time (`retrieve`, `generate`, `summarize`, `compare`, `respond`) based on
-  the conversation so far, instead of following one fixed pipeline.
-- 🧠 **Two-tier memory** — in-RAM short-term message history plus a
-  disk-persisted, LLM-maintained long-term summary per conversation.
+  scanned/text-light PDFs and pure image files. Each file type is handled by
+  its own loader module in `backend/loaders/`, dispatched through a single
+  registry keyed by file extension.
+- 🌐 **Bilingual retrieval with query expansion** — Arabic and English
+  queries are normalized, translated, spell-corrected, rephrased, and
+  concept-expanded (synonyms for evaluative language like "advantages" /
+  "more efficient") into multiple retrieval variants so cross-language,
+  typo-heavy, and semantically-phrased questions still find the right chunks.
+- 🔎 **Hybrid retrieval with cross-encoder reranking** — vector similarity
+  search followed by a reranking pass that blends a semantic cross-encoder
+  score with lexical/bigram overlap (Arabic- and English-aware), then
+  reselects for diversity (MMR-lite) and trims to a context character
+  budget so irrelevant or redundant chunks don't crowd out the real answer.
+- 🤖 **Agentic reasoning (ReAct loop) with semantic intent recognition** —
+  the agent chooses one action at a time (`retrieve`, `generate`,
+  `summarize`, `compare`, `respond`, `report`) based on the conversation so
+  far. It recognises comparison/evaluation intent from natural phrasing
+  ("which is better?", "pros and cons?") and resolves implicit references
+  ("the two methods", "this document") from the active document and memory
+  instead of always asking for clarification.
+- 🧠 **Structured two-tier memory** — in-RAM short-term message history
+  (summarized on message-count OR character-budget overflow) plus a
+  disk-persisted long-term memory of capped, deduplicated, importance-ranked
+  facts (not a single free-text paragraph) per conversation.
 - 🎙️ **Voice input** — record a question; Whisper transcribes it
   (Arabic/English auto-detection with an Egyptian-Arabic-tuned second pass)
   before it's handed to the agent.
 - ⚡ **Groq-backed generation** — fast hosted inference, swappable model via
   a single environment variable.
+- ✂️ **Concise-by-default answers** — response length matches question
+  complexity; examples are added only when they genuinely aid understanding
+  or were explicitly requested, not on every answer.
 - 🧩 **Pluggable embeddings** — local HuggingFace model by default, OpenAI
   embeddings as a drop-in alternative, both behind one `EMBEDDING_PROVIDER`
   switch.
@@ -167,6 +251,7 @@ ai-doc-assistant/
 │   ├── requirements.txt
 │   ├── .env.example
 │   ├── assets/fonts/               Bundled Amiri Arabic font (PDF reports)
+│   ├── loaders/                    Per-file-type document loaders (pdf/docx/text/image/excel) + registry
 │   ├── agent/
 │   │   ├── agent.py                ReAct loop (+ run_stream for /ws/chat)
 │   │   ├── llm.py                  Groq-backed action-selection LLM (JSON mode)
@@ -271,7 +356,20 @@ Nothing is hardcoded in source — every key below is read via `config.py`.
 See `backend/.env.example` for the full list (Qdrant path/collection,
 chunking, retrieval `k`, OCR toggle, Whisper model size, agent iteration
 limit, memory window sizes, etc.) — all have sensible defaults and rarely
-need to change.
+need to change. Notable additions:
+
+| Variable                   | Default                                        | Description                                                                 |
+|-----------------------------|-------------------------------------------------|-------------------------------------------------------------------------------|
+| `QUERY_EXPANSION_ENABLED`   | `true`                                          | Adds same-language synonym/concept query variants for semantic questions.  |
+| `RERANK_USE_CROSS_ENCODER`  | `true`                                          | Blend a semantic cross-encoder score into reranking (falls back to lexical-only if the model can't load). |
+| `CROSS_ENCODER_MODEL`       | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`    | Multilingual, CPU-friendly, no API key.                                    |
+| `RERANK_ALPHA`              | `0.6`                                           | Weight of the cross-encoder score vs. the lexical score (0-1).             |
+| `RERANK_DIVERSIFY`          | `true`                                          | Reselect the final chunk set for diversity (MMR-lite) after scoring.       |
+| `MMR_LAMBDA`                | `0.7`                                           | Relevance vs. diversity trade-off for `RERANK_DIVERSIFY` (0-1).            |
+| `MAX_CONTEXT_CHARS`         | `6000`                                          | Character budget for retrieved context sent to the LLM per answer.        |
+| `MEMORY_MAX_FACTS`          | `40`                                            | Cap on stored long-term-memory facts (lowest importance/oldest evicted first). |
+| `MEMORY_SUMMARY_MAX_CHARS`  | `1200`                                          | Character budget for rendered long-term-memory facts per prompt.          |
+| `MEMORY_MAX_CHARS`          | `12000`                                         | Short-term memory also summarizes once buffered message text crosses this budget. |
 
 ---
 
@@ -357,9 +455,12 @@ ingests it directly:
 
 1. With both servers running, open the app in your browser.
 2. Use the **Documents** panel in the sidebar (or `POST /api/upload`
-   directly) to upload one or more PDF/DOCX/TXT/MD/JSON/image files.
-3. The backend loads each file, OCRs it if needed (scanned PDFs / images),
-   splits it into chunks, embeds the chunks with the configured embeddings
+   directly) to upload one or more PDF/DOCX/TXT/MD/JSON/XLSX/XLS/CSV/image
+   files.
+3. The backend dispatches each file to its loader (`backend/loaders/`),
+   OCRs it if needed (scanned PDFs / images), splits it into chunks
+   (Excel sheets get sheet-summary + row-group chunks instead of generic
+   text splitting), embeds the chunks with the configured embeddings
    provider, and stores the vectors in the local Qdrant collection.
 4. Already-processed files (tracked by content hash in
    `processed_files.json`) are skipped on re-upload.

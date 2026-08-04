@@ -50,10 +50,12 @@ class Settings:
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-    # Model used by the agent's action-selection step. Defaults to the same
-    # model as the main answer generator; override with AGENT_MODEL to use
-    # a smaller/faster model (e.g. "llama-3.1-8b-instant") for planning.
-    AGENT_MODEL: str = os.getenv("AGENT_MODEL", GROQ_MODEL)
+    # Model used by the agent's action-selection step. This is a structured
+    # JSON routing decision (pick one of a handful of tools), not open-ended
+    # generation, so a smaller/faster model is used by default to cut
+    # per-turn planner latency; override with AGENT_MODEL (e.g. back to
+    # GROQ_MODEL) if routing quality needs the larger model instead.
+    AGENT_MODEL: str = os.getenv("AGENT_MODEL", "llama-3.1-8b-instant")
 
     LLM_TEMPERATURE: float = _float("LLM_TEMPERATURE", 0.0)
     LLM_MAX_TOKENS: int = _int("LLM_MAX_TOKENS", 800)
@@ -64,6 +66,12 @@ class Settings:
     # embedding API calls. See services/embeddings_provider.py.
     EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "local")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-large")
+    # Device for BOTH local torch models (the embedding model above and the
+    # cross-encoder reranker below): "auto" (default) uses a CUDA GPU when
+    # one is available and falls back to CPU otherwise — safe on machines
+    # with no GPU or a CPU-only torch build. Set "cpu" or "cuda" to force a
+    # choice. See utils/device.py.
+    EMBEDDING_DEVICE: str = os.getenv("EMBEDDING_DEVICE", "auto")
 
     # ── Vector store (Qdrant, local/embedded) ───────────────────────────
     QDRANT_PATH: str = os.getenv("QDRANT_PATH", "./qdrant_db")
@@ -77,6 +85,10 @@ class Settings:
         "PROCESSED_FILES_REGISTRY", "./processed_files.json"
     )
     ENABLE_PDF_OCR_FALLBACK: bool = _bool("ENABLE_PDF_OCR_FALLBACK", True)
+    # Hard cap on a single uploaded file's size. Rejected upfront with a
+    # clear error rather than letting an arbitrarily large file run through
+    # a fully in-memory, fully synchronous parse/chunk/embed pipeline.
+    MAX_UPLOAD_SIZE_MB: int = _int("MAX_UPLOAD_SIZE_MB", 200)
     RETRIEVER_K: int = _int("RETRIEVER_K", 8)
     RERANK_TOP_N: int = _int("RERANK_TOP_N", 6)
     # Coarse pre-filter only (see _retrieve() in rag_service.py) — lexical
@@ -89,8 +101,46 @@ class Settings:
     # build_prompt() that refuses to answer unless the context specifically
     # covers the question.
     CONFIDENCE_THRESHOLD: float = _float("CONFIDENCE_THRESHOLD", 0.05)
+
+    # ── Reranking (cross-encoder + lexical blend, diversity, context budget) ──
+    # Cross-encoder reranking blends a semantic relevance score (a small
+    # multilingual cross-encoder model, CPU-friendly, no API key — same
+    # "local, free" philosophy as the embeddings model) with the existing
+    # lexical/bigram overlap score, instead of relying on lexical overlap
+    # alone. Falls back permanently to lexical-only scoring for the process
+    # lifetime if the model can't be loaded (offline, etc).
+    RERANK_USE_CROSS_ENCODER: bool = _bool("RERANK_USE_CROSS_ENCODER", True)
+    CROSS_ENCODER_MODEL: str = os.getenv(
+        "CROSS_ENCODER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    )
+    # When any retrieved candidate is Excel-sourced (row_group/sheet_summary
+    # chunks), _retrieve() widens the final reranked result count up to this
+    # many chunks instead of stopping at RERANK_TOP_N — a question needing
+    # several spreadsheet rows would otherwise lose most of them to the
+    # smaller default top_n. See _retrieve() in rag_service.py.
+    EXCEL_RERANK_TOP_N: int = _int("EXCEL_RERANK_TOP_N", 12)
+    # Weight given to the cross-encoder score vs. the lexical score when both
+    # are available (0-1, higher = trust the cross-encoder more).
+    RERANK_ALPHA: float = _float("RERANK_ALPHA", 0.6)
+    # After scoring, greedily reselect the top_n chunks to also maximize
+    # diversity (MMR-lite) so near-duplicate/overlapping chunks don't crowd
+    # out distinct information within the same context window.
+    RERANK_DIVERSIFY: bool = _bool("RERANK_DIVERSIFY", True)
+    MMR_LAMBDA: float = _float("MMR_LAMBDA", 0.7)
+    # Hard cap on how many characters of retrieved context are sent to the
+    # LLM per answer — bounds prompt token usage regardless of how many/how
+    # large the reranked chunks are. Lowest-ranked chunks are trimmed first.
+    MAX_CONTEXT_CHARS: int = _int("MAX_CONTEXT_CHARS", 6000)
     CHUNK_SIZE: int = _int("CHUNK_SIZE", 700)
     CHUNK_OVERLAP: int = _int("CHUNK_OVERLAP", 150)
+
+    # Query expansion: adds LLM-generated synonym/concept reformulations of the
+    # user's ORIGINAL-language query (e.g. "advantages" -> "benefits, pros") as
+    # extra retrieval variants, on top of the existing translation/typo-fix/
+    # rephrase variants. Helps semantic/evaluative questions ("which is more
+    # efficient?", "pros and cons?") match document wording that doesn't share
+    # the user's exact vocabulary. See _rewrite_query() / _query_variants().
+    QUERY_EXPANSION_ENABLED: bool = _bool("QUERY_EXPANSION_ENABLED", True)
 
     # Chunking strategy: "recursive" (default, unchanged behavior — fixed
     # character-size splitting via RecursiveCharacterTextSplitter), "semantic"
@@ -127,6 +177,18 @@ class Settings:
     # Safety cap: merged chunks never grow past this many characters.
     HYBRID_CHUNK_MAX_CHARS: int = _int("HYBRID_CHUNK_MAX_CHARS", 1800)
 
+    # ── Excel ingestion (.xlsx/.xls/.csv) ───────────────────────────────
+    # Row-group chunk size is derived from CHUNK_SIZE/CHUNK_OVERLAP above
+    # (see loaders/excel_loader.py::_rows_per_group); these only bound how
+    # few/many rows a single chunk can hold.
+    EXCEL_ROWS_PER_CHUNK_MIN: int = _int("EXCEL_ROWS_PER_CHUNK_MIN", 3)
+    EXCEL_ROWS_PER_CHUNK_MAX: int = _int("EXCEL_ROWS_PER_CHUNK_MAX", 50)
+    EXCEL_SUMMARY_SAMPLE_ROWS: int = _int("EXCEL_SUMMARY_SAMPLE_ROWS", 5)
+    # Sheets larger than this are truncated (for indexing only) so a
+    # pathologically large spreadsheet can't block the synchronous upload
+    # request indefinitely.
+    EXCEL_MAX_ROWS_PER_SHEET: int = _int("EXCEL_MAX_ROWS_PER_SHEET", 20000)
+
     # ── Audio / OCR ──────────────────────────────────────────────────────
     WHISPER_MODEL_NAME: str = os.getenv("WHISPER_MODEL_NAME", "small")
     SILENCE_THRESHOLD_DB: float = _float("SILENCE_THRESHOLD_DB", -60.0)
@@ -138,11 +200,38 @@ class Settings:
     AGENT_DEBUG: bool = _bool("AGENT_DEBUG", False)
     DEFAULT_CONVERSATION_ID: str = os.getenv("DEFAULT_CONVERSATION_ID", "default")
 
+    # ── Profiling / debugging ───────────────────────────────────────────────
+    # Logs a per-stage latency breakdown (see utils/timing.py) for every
+    # /api/chat request: language detection, query rewriting/translation,
+    # embedding, Qdrant retrieval, reranking, MMR, agent planning, memory,
+    # LLM generation, and total request time. Overhead is a handful of
+    # perf_counter() calls per request — safe to leave on in production.
+    LOG_REQUEST_PROFILE: bool = _bool("LOG_REQUEST_PROFILE", True)
+    # Logs original query, detected language, every generated query variant,
+    # retrieved chunks per variant, lexical/cross-encoder scores before and
+    # after reranking, and the final context handed to the LLM. Verbose —
+    # intended for debugging retrieval/cross-language issues, not normal
+    # operation.
+    LOG_RETRIEVAL_DEBUG: bool = _bool("LOG_RETRIEVAL_DEBUG", False)
+
     # ── Memory ───────────────────────────────────────────────────────────
     MEMORY_MAX_MESSAGES: int = _int("MEMORY_MAX_MESSAGES", 25)
     MEMORY_KEEP_RECENT: int = _int("MEMORY_KEEP_RECENT", 4)
     MEMORY_WINDOW: int = _int("MEMORY_WINDOW", 6)
     MEMORY_STORAGE_DIR: str = os.getenv("MEMORY_STORAGE_DIR", "./memory_storage")
+    # Long-term memory is a capped, deduplicated store of discrete facts
+    # (see memory/summary_memory.py's FactStore) rather than one free-text
+    # paragraph. MEMORY_MAX_FACTS bounds how many facts are kept — lowest
+    # importance/oldest are evicted first once exceeded. MEMORY_SUMMARY_MAX_CHARS
+    # bounds how much of the rendered fact text is injected into any single
+    # prompt, regardless of how many facts have accumulated.
+    MEMORY_MAX_FACTS: int = _int("MEMORY_MAX_FACTS", 40)
+    MEMORY_SUMMARY_MAX_CHARS: int = _int("MEMORY_SUMMARY_MAX_CHARS", 1200)
+    # Short-term memory also summarizes once total character count crosses
+    # this budget, even if MEMORY_MAX_MESSAGES hasn't been reached yet — a
+    # handful of very long messages shouldn't be able to bloat token usage
+    # before the message-count trigger fires.
+    MEMORY_MAX_CHARS: int = _int("MEMORY_MAX_CHARS", 12000)
 
     # ── MinIO (object storage for uploaded files & generated reports) ─────
     # Uploaded originals are no longer written to local disk — they are
