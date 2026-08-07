@@ -20,6 +20,12 @@ class ReportRequest(BaseModel):
     # here for parity with the chat-driven "report" tool; the frontend
     # currently only reaches this feature through natural-language chat.
     topic: Optional[str] = None
+    # Required only when `topic` is set — a topic-scoped report retrieves
+    # via the vector store (see Document Isolation) and must be scoped to
+    # one conversation's own documents, same as any other retrieval. The
+    # whole-document path (no topic) reads the named file directly and
+    # doesn't need it.
+    conversation_id: Optional[str] = None
 
 
 @router.post("/reports/generate")
@@ -34,9 +40,19 @@ async def generate_report(request: ReportRequest):
     if not request.filename.strip():
         raise HTTPException(status_code=400, detail="filename is required.")
 
+    has_topic = bool(request.topic and request.topic.strip())
+    if has_topic and not (request.conversation_id and request.conversation_id.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="conversation_id is required when a topic is given (topic reports retrieve "
+            "from the vector store, which is scoped per conversation).",
+        )
+
     try:
-        if request.topic and request.topic.strip():
-            result = report_service.generate_topic_report(request.topic, document=request.filename)
+        if has_topic:
+            result = report_service.generate_topic_report(
+                request.topic, request.conversation_id, document=request.filename
+            )
         else:
             result = report_service.generate_report(request.filename)
     except FileNotFoundError as e:

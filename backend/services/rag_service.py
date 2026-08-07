@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections import Counter
 from functools import lru_cache
 from typing import Any, Callable, List, Optional, Tuple
@@ -35,6 +36,7 @@ import numpy as np
 from langchain_core.documents import Document
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from qdrant_client.http import models as qdrant_models
 
 from config import settings
 from loaders.registry import (
@@ -42,7 +44,7 @@ from loaders.registry import (
     get_content_type,
     load_document_from_bytes as _dispatch_load,
 )
-from services.db_service import get_client, get_collection_name, ensure_collection
+from services.db_service import get_client, get_collection_name, ensure_collection, with_retries
 from services.embeddings_provider import get_embeddings
 from services.llm_provider import GroqLLM, get_llm as _get_shared_llm
 from services import storage_service
@@ -96,17 +98,24 @@ def _refresh_retriever():
 
 
 def load_existing_db() -> bool:
-    """Call once at startup to attach to an existing Qdrant collection."""
+    """Call once at startup to attach to an existing Qdrant collection.
+    Retries a bounded number of times (Qdrant may still be starting up),
+    but never raises — if it still can't connect, the app starts anyway
+    and retrieval simply reports not-ready until a later call succeeds."""
     global _vector_db
-    try:
+
+    def _attach() -> int:
         client = get_client()
         client.get_collection(get_collection_name())
+        return client.get_collection(get_collection_name()).points_count
+
+    try:
+        count = with_retries(_attach, what="load_existing_db")
         _vector_db = QdrantVectorStore(
-            client=client,
+            client=get_client(),
             collection_name=get_collection_name(),
             embedding=embeddings,
         )
-        count = client.get_collection(get_collection_name()).points_count
         log.info(f"Loaded existing DB — {count} vectors")
         _refresh_retriever()
         return True
@@ -121,6 +130,33 @@ def is_ready() -> bool:
     if _retriever is None:
         load_existing_db()
     return _retriever is not None
+
+
+# ── Document isolation ──────────────────────────────────────────────────────
+# All conversations still share ONE physical Qdrant collection (document-
+# level storage isolation, e.g. one collection/namespace per conversation,
+# is explicitly out of scope for this change) — isolation is enforced at
+# query time instead, via a metadata filter on every vector search, plus
+# tagging every indexed chunk with the conversation_id that uploaded it at
+# ingestion time. See `_conversation_filter`, `update_db_files`, `_retrieve`.
+
+def _conversation_filter(conversation_id: str) -> qdrant_models.Filter:
+    """
+    Qdrant filter restricting a search/delete to exactly one
+    conversation_id's chunks. `langchain_qdrant.QdrantVectorStore` stores
+    each Document's metadata dict under the payload key "metadata" (its
+    default `metadata_payload_key` — verified against the installed
+    langchain-qdrant version), so the field path is "metadata.conversation_id",
+    not a top-level "conversation_id" key.
+    """
+    return qdrant_models.Filter(
+        must=[
+            qdrant_models.FieldCondition(
+                key="metadata.conversation_id",
+                match=qdrant_models.MatchValue(value=conversation_id),
+            )
+        ]
+    )
 
 
 # ── Text utilities ─────────────────────────────────────────────────────────────
@@ -352,13 +388,29 @@ def _query_variants(question: str, lang: str) -> List[str]:
     - original query
     - normalized Arabic / lowercase English
     - typo-corrected query + synonym alternatives
-    - Arabic <-> English translations (+ their own typo-fix/alternatives)
+    - a translation into whichever language the query is NOT already in
+      (+ its local, non-LLM normalized/loose forms)
 
-    The LLM calls involved are independent within each "wave" (rewriting
-    the original query and translating it both ways don't depend on each
-    other; rewriting each translation doesn't depend on the other
-    translation direction), so they run concurrently via _run_concurrent
-    instead of one-by-one — see the docstring there.
+    Only TWO Groq calls are made here (down from up to five — see Issue 1
+    investigation): rewriting the original query (typo-fix + synonym
+    alternatives) and translating it into the other language are
+    independent, so they run concurrently via _run_concurrent instead of
+    one-by-one — see the docstring there. Two LLM-powered passes that used
+    to run on top of this were removed as redundant, not just slow:
+    - Translating into BOTH "en" and "ar" unconditionally used to fire
+      regardless of the query's actual language, so one of the two calls
+      was always given the wrong-language instruction (e.g. "translate
+      this Arabic text to English" for a query that was already English)
+      and produced a useless variant. Only the genuinely useful direction
+      is requested now.
+    - A second-pass typo-fix/synonym-expansion LLM call on top of the
+      translated text was removed: translations from this model are
+      reliably clean of spelling errors (they're generated, not copied
+      from a typing user), and synonym coverage is already produced above
+      on the original-language query — the second pass added Groq load
+      without a measured retrieval-quality gain. Local normalization
+      (lowercase/loose/diacritic-stripped forms) still runs on the
+      translated text exactly as before.
     """
     q = _clean(question)
     if not q:
@@ -383,14 +435,14 @@ def _query_variants(question: str, lang: str) -> List[str]:
         add(q.lower())
         add(_loose_english(q))
 
-    # Wave 1: rewriting the original query and translating it in both
-    # directions are fully independent LLM calls.
+    # Rewriting the original query and translating it into the other
+    # language are fully independent LLM calls — run concurrently.
     max_alts = 3 if settings.QUERY_EXPANSION_ENABLED else 1
-    with timing.substage("query_rewrite_expand_translate_wave1"):
-        (fixed, alternatives), tr_en, tr_ar = _run_concurrent([
+    target_lang = "ar" if detected == "en" else "en"
+    with timing.substage("query_rewrite_and_translate"):
+        (fixed, alternatives), translated = _run_concurrent([
             lambda: _rewrite_query(q, detected, max_alts),
-            lambda: _translate(q, "en"),
-            lambda: _translate(q, "ar"),
+            lambda: _translate(q, target_lang),
         ])
 
     for alt in alternatives:
@@ -406,47 +458,14 @@ def _query_variants(question: str, lang: str) -> List[str]:
             add(fixed.lower())
             add(_loose_english(fixed))
 
-    # Wave 2: rewriting each translation is independent of the other
-    # translation direction, so both run concurrently too.
-    wave2_tasks: List = []
-    wave2_keys: List[str] = []
-    if tr_en:
-        wave2_tasks.append(lambda: _rewrite_query(tr_en, "en", 1))
-        wave2_keys.append("en")
-    if tr_ar:
-        wave2_tasks.append(lambda: _rewrite_query(tr_ar, "ar", 1))
-        wave2_keys.append("ar")
-
-    with timing.substage("query_rewrite_translated_wave2"):
-        wave2 = dict(zip(wave2_keys, _run_concurrent(wave2_tasks)))
-
-    if tr_en:
-        add(tr_en)
-        add(tr_en.lower())
-        add(_loose_english(tr_en))
-
-        fixed_en, alts_en = wave2.get("en", ("", ()))
-        if fixed_en:
-            add(fixed_en)
-            add(fixed_en.lower())
-            add(_loose_english(fixed_en))
-        for alt in alts_en:
-            add(alt)
-            add(alt.lower())
-
-    if tr_ar:
-        add(tr_ar)
-        add(_normalize_arabic(tr_ar))
-        add(_loose_arabic(tr_ar))
-
-        fixed_ar, alts_ar = wave2.get("ar", ("", ()))
-        if fixed_ar:
-            add(fixed_ar)
-            add(_normalize_arabic(fixed_ar))
-            add(_loose_arabic(fixed_ar))
-        for alt in alts_ar:
-            add(alt)
-            add(_normalize_arabic(alt))
+    if translated:
+        add(translated)
+        if target_lang == "ar":
+            add(_normalize_arabic(translated))
+            add(_loose_arabic(translated))
+        else:
+            add(translated.lower())
+            add(_loose_english(translated))
 
     return variants[:22]
 
@@ -652,6 +671,7 @@ def _rerank(
 def _retrieve(
     question: str,
     lang: str,
+    conversation_id: str,
     k: Optional[int] = None,
     top_n: Optional[int] = None,
     source_filter: Optional[str] = None,
@@ -665,8 +685,14 @@ def _retrieve(
     `source_filter`, if given, restricts results to chunks whose
     metadata["source"] exactly matches it (used by topic-scoped report
     generation to search within one named document instead of the whole
-    knowledge base). Used internally by `ask_question` and exposed via
-    `retrieve()` for the agent's retrieve tool.
+    knowledge base) — applied client-side, AFTER the vector search.
+    `conversation_id` is required and restricts the vector search ITSELF
+    (a Qdrant-side metadata filter, see `_conversation_filter`) to chunks
+    uploaded by that conversation — see the Document Isolation
+    implementation. There is no "search everything" mode anymore: every
+    caller must know which conversation it's retrieving for. Used
+    internally by `ask_question` and exposed via `retrieve()` for the
+    agent's retrieve tool.
 
     Returns (ranked_docs, debug_str, per_doc_debug) — `per_doc_debug` is
     the same length/order as `ranked_docs` and carries each doc's
@@ -677,6 +703,7 @@ def _retrieve(
     """
     vdb = _get_vector_db()
     search_k = k or settings.RETRIEVER_K
+    conv_filter = _conversation_filter(conversation_id)
 
     with timing.stage("query_variant_generation_total"):
         variants = _query_variants(question, lang)
@@ -705,7 +732,9 @@ def _retrieve(
         # fan out across threads; embedding text is the expensive part and
         # is done once, batched, up front (see comment at the call site).
         try:
-            hits = vdb.similarity_search_with_score_by_vector(vector, k=search_k)
+            hits = vdb.similarity_search_with_score_by_vector(
+                vector, k=search_k, filter=conv_filter
+            )
         except Exception as e:
             log.error(f"Retrieval error for '{q}': {e}")
             return []
@@ -997,11 +1026,21 @@ def get_stored_file_bytes(object_name: str) -> bytes:
     return storage_service.download_bytes(settings.MINIO_BUCKET_UPLOADS, object_name)
 
 
-def list_stored_files() -> list[dict]:
+def list_stored_files(conversation_id: Optional[str] = None) -> list[dict]:
+    """
+    List registry entries, optionally restricted to one conversation_id's
+    own uploads. `conversation_id=None` (the default, used by the existing
+    /stored-files route and the report tool's whole-document resolution)
+    lists every uploaded file across every conversation — that surface
+    remains intentionally out of scope for this change (see the Document
+    Isolation implementation notes); only vector retrieval is scoped.
+    """
     registry = _load_registry()
     files = []
 
     for _, info in registry.items():
+        if conversation_id is not None and info.get("conversation_id") != conversation_id:
+            continue
         object_name = info.get("stored_path")
         files.append({
             "filename": info.get("filename"),
@@ -1009,6 +1048,8 @@ def list_stored_files() -> list[dict]:
             "file_type": info.get("file_type"),
             "chunks": info.get("chunks", 0),
             "processed_at": info.get("processed_at"),
+            "conversation_id": info.get("conversation_id"),
+            "document_id": info.get("document_id"),
             "download_url": storage_service.presigned_url(
                 settings.MINIO_BUCKET_UPLOADS, object_name
             ) if object_name else None,
@@ -1016,6 +1057,62 @@ def list_stored_files() -> list[dict]:
 
     files.sort(key=lambda x: x.get("processed_at") or "", reverse=True)
     return files
+
+
+def delete_conversation_documents(conversation_id: str) -> int:
+    """
+    Physically delete every indexed chunk belonging to `conversation_id`
+    from Qdrant, and drop that conversation's entries from the file
+    registry — called on conversation reset (see routes/chat.py::chat_reset)
+    so a reset conversation's previously uploaded documents become
+    genuinely inaccessible to future retrievals under that same
+    conversation_id, not merely hidden.
+
+    Physical deletion IS feasible here (Qdrant's client supports deleting
+    points by the exact same metadata filter used at query time, even in
+    the local/embedded mode this app uses — verified directly against the
+    installed qdrant-client), so there is no "soft delete"/orphaned-vector
+    fallback needed: this is scoped by the identical
+    `metadata.conversation_id` filter `_retrieve()` uses, so it is
+    impossible for this call to remove another conversation_id's points.
+
+    Registry entries for OTHER conversation_ids that happen to reference
+    the same underlying MinIO object (byte-identical file uploaded by more
+    than one conversation) are left untouched — only entries whose own
+    `conversation_id` matches are dropped, and the MinIO original itself
+    is not deleted (out of scope — this only affects retrieval-eligible
+    state, not raw file storage/downloads).
+
+    Safe to call for a conversation with no indexed documents (no-op).
+    Returns the number of registry entries removed.
+    """
+    if is_ready():
+        conv_filter = _conversation_filter(conversation_id)
+        try:
+            with_retries(
+                lambda: get_client().delete(
+                    collection_name=get_collection_name(), points_selector=conv_filter
+                ),
+                what=f"delete vectors for conversation_id={conversation_id!r}",
+            )
+        except Exception as e:
+            log.error(f"Failed to delete vectors for conversation_id={conversation_id!r}: {e}")
+            raise
+
+    registry = _load_registry()
+    keys_to_remove = [
+        k for k, info in registry.items() if info.get("conversation_id") == conversation_id
+    ]
+    for k in keys_to_remove:
+        del registry[k]
+    if keys_to_remove:
+        _save_registry(registry)
+        log.info(
+            f"Document isolation: removed {len(keys_to_remove)} registry entr(y/ies) "
+            f"for conversation_id={conversation_id!r} on reset."
+        )
+
+    return len(keys_to_remove)
 
 
 def find_registry_entry(filename: str) -> Optional[dict]:
@@ -1226,11 +1323,32 @@ def _hybrid_split_documents(docs: List[Document]) -> List[Document]:
 
 # ── Public API: ingestion ───────────────────────────────────────────────────────
 
+def _registry_key(conversation_id: str, file_hash: str) -> str:
+    """
+    Registry dedup key. Deliberately scoped by (conversation_id, hash),
+    NOT hash alone: a global hash-only key would mean the first
+    conversation to ever upload a given file's exact bytes "claims" it,
+    and every other conversation uploading the identical file afterward
+    would be silently skipped as "already processed" — meaning that
+    second conversation would never get its OWN indexed, conversation_id-
+    tagged chunks in Qdrant at all, breaking retrieval for it entirely.
+    Scoping by conversation_id means each conversation independently
+    re-embeds and indexes a file it uploads, even if another conversation
+    already uploaded byte-identical content — see Document Isolation.
+    """
+    return f"{conversation_id}:{file_hash}"
+
+
 def update_db_files(
-    files: List[dict[str, Any]], on_progress: Optional[Callable[[str], None]] = None
+    files: List[dict[str, Any]],
+    conversation_id: str,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> int:
     """
-    Ingest a list of {'filename': str, 'data': bytes} dicts into Qdrant.
+    Ingest a list of {'filename': str, 'data': bytes} dicts into Qdrant,
+    tagging every resulting chunk with `conversation_id` (and a fresh
+    per-upload `document_id`) so retrieval can later be scoped to exactly
+    this conversation's own documents — see Document Isolation.
     Also uploads the original file bytes to MinIO (settings.MINIO_BUCKET_UPLOADS).
     Returns total number of chunks added.
 
@@ -1262,9 +1380,9 @@ def update_db_files(
 
         h = _file_hash(data)
 
-        if h in registry:
+        if _registry_key(conversation_id, h) in registry:
             skipped.append(filename)
-            log.info(f"Skip already processed: {filename}")
+            log.info(f"Skip already processed for conversation_id={conversation_id!r}: {filename}")
         else:
             new_files.append((filename, data, h))
 
@@ -1279,11 +1397,17 @@ def update_db_files(
 
     for filename, data, fhash in new_files:
         stored_path = _save_uploaded_file(filename, data, fhash)
+        document_id = str(uuid.uuid4())
 
         docs = _load_document_from_bytes(filename, data)
 
         for d in docs:
             d.metadata["stored_path"] = stored_path
+            # Document-isolation metadata — required on every chunk so
+            # retrieval's Qdrant filter (see _conversation_filter) can
+            # restrict a search to exactly this conversation's documents.
+            d.metadata["conversation_id"] = conversation_id
+            d.metadata["document_id"] = document_id
 
         all_docs.extend(docs)
 
@@ -1291,6 +1415,7 @@ def update_db_files(
             "hash": fhash,
             "stored_path": stored_path,
             "docs_count": len(docs),
+            "document_id": document_id,
         }
 
     all_docs = _deduplicate(all_docs)
@@ -1367,12 +1492,14 @@ def update_db_files(
     for filename, info in per_file_info.items():
         fhash = info["hash"]
 
-        registry[fhash] = {
+        registry[_registry_key(conversation_id, fhash)] = {
             "filename": filename,
             "stored_path": info["stored_path"],
             "file_type": _get_file_type(filename),
             "chunks": cps.get(filename, 0),
             "processed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "conversation_id": conversation_id,
+            "document_id": info["document_id"],
         }
 
     _save_registry(registry)
@@ -1389,9 +1516,10 @@ def update_db_files(
 
 # ── Public API: direct question answering (non-agent /chat path) ───────────────
 
-def ask_question(query: str, lang: str = "auto") -> dict:
+def ask_question(query: str, conversation_id: str, lang: str = "auto") -> dict:
     """
-    Answer a question using RAG directly (single retrieval + single generation).
+    Answer a question using RAG directly (single retrieval + single generation),
+    scoped to `conversation_id`'s own uploaded documents only.
     Returns {"answer": str, "sources": str}.
     """
     if not is_ready():
@@ -1401,7 +1529,7 @@ def ask_question(query: str, lang: str = "auto") -> dict:
         }
 
     detected_lang = detect_language(query) if lang == "auto" else lang
-    docs, debug, _ = _retrieve(query, detected_lang)
+    docs, debug, _ = _retrieve(query, detected_lang, conversation_id)
     log.debug(f"Retrieval:\n{debug}")
 
     if not docs:
@@ -1494,13 +1622,20 @@ def _build_context(docs: List[Document]) -> str:
 # never has to know about langchain/Qdrant internals.
 
 def retrieve(
-    question: str, lang: str = "auto", top_k: int = 5, source_filter: Optional[str] = None
+    question: str,
+    conversation_id: str,
+    lang: str = "auto",
+    top_k: int = 5,
+    source_filter: Optional[str] = None,
 ) -> List[dict]:
     """
-    Retrieve relevant chunks for a question. Used by the agent's retrieve
-    tool, and by topic-scoped report generation (services.report_service)
-    with a larger top_k and, optionally, `source_filter` to search within
-    one named document instead of the whole knowledge base.
+    Retrieve relevant chunks for a question, restricted to `conversation_id`'s
+    own uploaded documents (see Document Isolation — every vector search
+    goes through `_retrieve`'s Qdrant-side conversation_id filter; there is
+    no unscoped/global search mode). Used by the agent's retrieve tool, and
+    by topic-scoped report generation (services.report_service) with a
+    larger top_k and, optionally, `source_filter` to search within one
+    named document instead of that conversation's whole knowledge base.
 
     Returns a list of dicts: {"id", "text", "metadata": {...}}
     """
@@ -1509,10 +1644,11 @@ def retrieve(
 
     detected_lang = detect_language(question) if lang == "auto" else lang
     docs, debug, debugs = _retrieve(
-        question, detected_lang, k=max(top_k, settings.RETRIEVER_K), top_n=top_k,
+        question, detected_lang, conversation_id,
+        k=max(top_k, settings.RETRIEVER_K), top_n=top_k,
         source_filter=source_filter,
     )
-    log.debug(f"[agent] Retrieval for '{question}':\n{debug}")
+    log.debug(f"[agent] Retrieval for '{question}' (conversation_id={conversation_id!r}):\n{debug}")
 
     scores_by_id = {id(d): dbg.get("score", 0.0) for d, dbg in zip(docs, debugs)}
 
@@ -1528,6 +1664,11 @@ def retrieve(
             "document_type": d.metadata.get("file_type", "unknown"),
             "page": page,
             "chunk_index": chunk_index,
+            # Document-isolation metadata (see update_db_files) — forwarded
+            # for debuggability; retrieval is already scoped by the Qdrant
+            # filter above regardless of these being present in the result.
+            "conversation_id": d.metadata.get("conversation_id"),
+            "document_id": d.metadata.get("document_id"),
             # Relevance score (0-1) from reranking — lets callers that ask
             # for many candidates at once (e.g. topic-scoped report
             # generation) filter out weakly-relevant padding instead of

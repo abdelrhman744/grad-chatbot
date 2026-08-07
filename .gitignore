@@ -4,9 +4,11 @@ backend/.venv/
 **/__pycache__/
 *.py[cod]
 
-# Environment
+# Environment (real secrets only — .env.example templates are committed)
+/.env
 backend/.env
-backend/.env.example
+frontend/.env.local
+
 # Node
 frontend/node_modules/
 frontend/.next/

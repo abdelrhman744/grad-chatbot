@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 
 from config import settings
@@ -48,7 +48,7 @@ def _categorize_error(stage: str, exc: Exception) -> str:
     return f"Ingestion failed: {exc}"
 
 
-def _ingest_job(job_id: str, file_dicts: List[dict]) -> None:
+def _ingest_job(job_id: str, file_dicts: List[dict], conversation_id: str) -> None:
     last_stage = "queued"
 
     def _on_progress(stage: str) -> None:
@@ -57,7 +57,9 @@ def _ingest_job(job_id: str, file_dicts: List[dict]) -> None:
         upload_jobs.set_stage(job_id, stage)
 
     try:
-        chunks_added = update_db_files(file_dicts, on_progress=_on_progress)
+        chunks_added = update_db_files(
+            file_dicts, conversation_id=conversation_id, on_progress=_on_progress
+        )
         upload_jobs.mark_done(job_id, chunks_added)
     except Exception as e:
         log.exception(f"Background ingestion failed for job {job_id}")
@@ -65,7 +67,15 @@ def _ingest_job(job_id: str, file_dicts: List[dict]) -> None:
 
 
 @router.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    # No default: which conversation an upload belongs to must always be
+    # explicit — a silent fallback here would tag documents with the wrong
+    # (or a shared) conversation_id and defeat Document Isolation just as
+    # surely as the old conversation_id fallback did. See
+    # frontend/lib/conversation.ts for the per-tab id this must carry.
+    conversation_id: str = Form(...),
+):
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
@@ -97,7 +107,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
     # Fire-and-forget: the request returns immediately with a job id, well
     # before the frontend's request timeout, regardless of how long
     # ingestion actually takes.
-    asyncio.create_task(asyncio.to_thread(_ingest_job, job_id, file_dicts))
+    asyncio.create_task(asyncio.to_thread(_ingest_job, job_id, file_dicts, conversation_id))
 
     return {"job_id": job_id, "status": "queued"}
 

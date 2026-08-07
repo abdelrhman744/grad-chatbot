@@ -46,6 +46,14 @@ def _float(name: str, default: float) -> float:
 
 
 class Settings:
+    # ── CORS ─────────────────────────────────────────────────────────────
+    # Comma-separated allowlist of origins permitted to call the API with
+    # credentials. Wildcard ("*") is intentionally not supported here: it
+    # is rejected by browsers when combined with allow_credentials=True
+    # (see main.py), so a real allowlist is required. Defaults to the
+    # frontend's own dev/Docker origin.
+    FRONTEND_ORIGIN: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+
     # ── LLM (Groq) ───────────────────────────────────────────────────────
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -73,9 +81,22 @@ class Settings:
     # choice. See utils/device.py.
     EMBEDDING_DEVICE: str = os.getenv("EMBEDDING_DEVICE", "auto")
 
-    # ── Vector store (Qdrant, local/embedded) ───────────────────────────
-    QDRANT_PATH: str = os.getenv("QDRANT_PATH", "./qdrant_db")
+    # ── Vector store (Qdrant, server mode) ──────────────────────────────
+    # Points at a Qdrant *server* (REST API) — either the `qdrant` service
+    # in docker-compose.yml (QDRANT_URL=http://qdrant:6333, set via the
+    # backend service's `environment:` block) or a locally-run Qdrant
+    # server for native (non-Docker) development. Embedded/file-mode
+    # Qdrant is no longer supported.
+    QDRANT_URL: str = os.getenv("QDRANT_URL", "http://localhost:6333")
+    QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")
     QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "enterprise_docs")
+    QDRANT_TIMEOUT_SECONDS: float = _float("QDRANT_TIMEOUT_SECONDS", 10.0)
+    # Bounded retry/backoff applied to Qdrant operations (client creation,
+    # collection checks, deletes, ...) so a transient network blip or a
+    # Qdrant container that's still starting doesn't immediately fail the
+    # request/startup — see services/db_service.py::_with_retries.
+    QDRANT_CONNECT_RETRIES: int = _int("QDRANT_CONNECT_RETRIES", 5)
+    QDRANT_RETRY_DELAY_SECONDS: float = _float("QDRANT_RETRY_DELAY_SECONDS", 2.0)
 
     # ── RAG pipeline ─────────────────────────────────────────────────────
     # Deprecated: originals are now stored in MinIO (MINIO_BUCKET_UPLOADS).
@@ -200,6 +221,23 @@ class Settings:
     AGENT_DEBUG: bool = _bool("AGENT_DEBUG", False)
     DEFAULT_CONVERSATION_ID: str = os.getenv("DEFAULT_CONVERSATION_ID", "default")
 
+    # ── Agent lifecycle (in-process agent/session.py registry) ─────────────
+    # A conversation's Agent — and the ShortMemory/FactStore/active_document
+    # it owns in RAM — is evicted from the registry once it has had no
+    # in-flight request AND has been inactive for this many seconds. A
+    # later request with the same conversation_id transparently creates a
+    # fresh Agent; only the in-RAM state is affected, not the persisted
+    # memory_storage/*.json fact store. Default 1800s = 30 minutes.
+    AGENT_IDLE_TIMEOUT_SECONDS: int = _int("AGENT_IDLE_TIMEOUT_SECONDS", 1800)
+    # How often the background cleanup pass scans the registry for idle
+    # conversations to evict. A conversation can live up to roughly
+    # (AGENT_IDLE_TIMEOUT_SECONDS + AGENT_CLEANUP_INTERVAL_SECONDS) after
+    # its last activity before it's actually evicted, in the worst case.
+    # Default 300s = 5 minutes — a full dict scan at this size is
+    # microseconds of work even with tens of thousands of entries, so this
+    # interval is set for freshness, not to reduce scan cost.
+    AGENT_CLEANUP_INTERVAL_SECONDS: int = _int("AGENT_CLEANUP_INTERVAL_SECONDS", 300)
+
     # ── Profiling / debugging ───────────────────────────────────────────────
     # Logs a per-stage latency breakdown (see utils/timing.py) for every
     # /api/chat request: language detection, query rewriting/translation,
@@ -207,6 +245,14 @@ class Settings:
     # LLM generation, and total request time. Overhead is a handful of
     # perf_counter() calls per request — safe to leave on in production.
     LOG_REQUEST_PROFILE: bool = _bool("LOG_REQUEST_PROFILE", True)
+    # Python logging level for the whole app (main.py's logging.basicConfig).
+    # Kept at INFO by default — deliberately separate from AGENT_DEBUG /
+    # LOG_RETRIEVAL_DEBUG, which gate WHETHER certain log.debug(...) calls
+    # exist in a given code path at all; this controls whether debug-level
+    # calls emit anything regardless. Only needs to be "DEBUG" when actively
+    # tracing (see agent.py's _debug_step, llm_provider.py's
+    # _log_outgoing_messages).
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     # Logs original query, detected language, every generated query variant,
     # retrieved chunks per variant, lexical/cross-encoder scores before and
     # after reranking, and the final context handed to the LLM. Verbose —
@@ -238,6 +284,22 @@ class Settings:
     # streamed straight into a MinIO bucket. Set these to point at your own
     # MinIO deployment (see docker-compose.yml for a local dev instance).
     MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+    # Host:port used ONLY when building presigned download URLs — these are
+    # handed to the browser, which cannot resolve the Docker service name
+    # `minio` used for MINIO_ENDPOINT (the backend's own internal S3 calls).
+    # Defaults to MINIO_ENDPOINT so native (non-Docker) dev, where both are
+    # already the same host, needs no extra config; docker-compose.yml
+    # overrides this to `localhost:9000` for the backend container.
+    MINIO_PUBLIC_ENDPOINT: str = os.getenv("MINIO_PUBLIC_ENDPOINT", "") or os.getenv(
+        "MINIO_ENDPOINT", "localhost:9000"
+    )
+    # minio-py needs a bucket's region to sign requests (incl. presigned
+    # URLs) and otherwise auto-discovers it with a live GET request against
+    # MINIO_ENDPOINT — which the MINIO_PUBLIC_ENDPOINT-configured signing
+    # client can't reach (that host is meant for the browser, not the
+    # backend container). Setting it explicitly skips that lookup entirely.
+    # "us-east-1" is the minio/minio image's own default region.
+    MINIO_REGION: str = os.getenv("MINIO_REGION", "us-east-1")
     MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
     MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "minioadmin")
     MINIO_SECURE: bool = _bool("MINIO_SECURE", False)

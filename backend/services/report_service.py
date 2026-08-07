@@ -461,13 +461,16 @@ Excerpts:
         return True  # fail open — a transient LLM error shouldn't block a report
 
 
-def build_topic_report_data(topic: str, document: Optional[str] = None) -> dict:
+def build_topic_report_data(
+    topic: str, conversation_id: str, document: Optional[str] = None
+) -> dict:
     """
     Topic-scoped counterpart to build_report_data(): instead of re-reading
     one whole document end to end, retrieve the chunks most relevant to
-    `topic` — across the entire uploaded knowledge base, or within
-    `document` only if one was named — and run the same MAP/REDUCE pipeline
-    over the retrieved chunk text instead of over whole-document pages.
+    `topic` — across `conversation_id`'s own uploaded knowledge base only
+    (see Document Isolation), or within `document` only if one was named —
+    and run the same MAP/REDUCE pipeline over the retrieved chunk text
+    instead of over whole-document pages.
 
     Raises ValueError if too little relevant material is found, so the
     caller can tell the user that plainly instead of generating a report
@@ -479,7 +482,9 @@ def build_topic_report_data(topic: str, document: Optional[str] = None) -> dict:
 
     lang = detect_language(topic)
 
-    chunks = retrieve(topic, lang=lang, top_k=TOPIC_REPORT_TOP_K, source_filter=document)
+    chunks = retrieve(
+        topic, conversation_id, lang=lang, top_k=TOPIC_REPORT_TOP_K, source_filter=document
+    )
 
     # retrieve() with a large top_k returns its best top_k candidates
     # regardless of whether that many are genuinely relevant — for a chat
@@ -848,16 +853,19 @@ def generate_report(filename: str) -> dict:
     }
 
 
-def generate_topic_report(topic: str, document: Optional[str] = None) -> dict:
+def generate_topic_report(
+    topic: str, conversation_id: str, document: Optional[str] = None
+) -> dict:
     """
     Generate a topic-scoped PDF report: retrieves the material most
-    relevant to `topic` (across all uploaded documents, or within
-    `document` only if given) and reuses the same MAP/REDUCE/PDF pipeline
-    as generate_report(). Raises ValueError if too little relevant
-    material was found for the topic — the caller (ReportTool) surfaces
-    that as a plain "not enough information" answer instead of a report.
+    relevant to `topic` (across `conversation_id`'s own uploaded documents
+    only, or within `document` only if given) and reuses the same
+    MAP/REDUCE/PDF pipeline as generate_report(). Raises ValueError if too
+    little relevant material was found for the topic — the caller
+    (ReportTool) surfaces that as a plain "not enough information" answer
+    instead of a report.
     """
-    data = build_topic_report_data(topic, document=document)
+    data = build_topic_report_data(topic, conversation_id, document=document)
     pdf_bytes = render_report_pdf(data)
 
     object_name = _topic_report_object_name(topic)

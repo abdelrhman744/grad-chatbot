@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Globe2, Languages, Loader2, SendHorizontal, Sparkles, AlertTriangle } from "lucide-react";
 import { askVoice, resetConversation, streamChat, ChatResponse, ReportInfo } from "@/services/api";
+import { getConversationId } from "@/lib/conversation";
 import AnswerBox from "./AnswerBox";
 import SourceBox from "./SourceBox";
 import ReportCard from "./ReportCard";
@@ -35,6 +36,12 @@ export default function ChatBox({ resetSignal }: Props) {
   const [language, setLanguage] = useState<Language>("auto");
   const [submitting, setSubmitting] = useState(false);
 
+  // This tab's own conversation id (see lib/conversation.ts) — persists for
+  // the lifetime of the tab (sessionStorage), distinct from every other tab
+  // or user, so this component's state and the backend's Agent/memory for
+  // this conversation can never leak into another tab's conversation.
+  const [conversationId] = useState<string>(() => getConversationId());
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isFirstRender = useRef(true);
@@ -48,9 +55,9 @@ export default function ChatBox({ resetSignal }: Props) {
       isFirstRender.current = false;
       return;
     }
-    resetConversation().catch(() => {});
+    resetConversation(conversationId).catch(() => {});
     setMessages([]);
-  }, [resetSignal]);
+  }, [resetSignal, conversationId]);
 
   const addUserMessage = (text: string, stt?: string) => {
     const id = crypto.randomUUID();
@@ -136,7 +143,7 @@ export default function ChatBox({ resetSignal }: Props) {
 
     const aiId = addUserMessage(q);
 
-    streamChat(q, language, "default", {
+    streamChat(q, language, conversationId, {
       onStatus: (text) => setAIStatus(aiId, text),
       onToken: (token) => appendAIToken(aiId, token),
       onDone: ({ answer, sources, report }) => {
@@ -158,7 +165,7 @@ export default function ChatBox({ resetSignal }: Props) {
     const aiId = addUserMessage("Voice message…");
 
     try {
-      const res = await askVoice(blob, language);
+      const res = await askVoice(blob, language, conversationId);
 
       setMessages((prev) =>
         prev.map((m) =>

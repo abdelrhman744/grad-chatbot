@@ -34,9 +34,19 @@ class ReportTool:
 
     def __init__(
         self,
+        conversation_id: str,
         active_document_provider: Optional[Callable[[], Optional[str]]] = None,
         active_document_setter: Optional[Callable[[str], None]] = None,
     ):
+        # Used only by the topic-scoped report path (_run_topic_report),
+        # which retrieves via rag_service.retrieve() and must therefore be
+        # scoped to this conversation's own documents like any other
+        # retrieval — see Document Isolation. The whole-document report
+        # path (run(), below) reads a named file directly from MinIO/the
+        # global registry and is NOT scoped by conversation_id — see the
+        # Document Isolation implementation notes for why that's a
+        # deliberate, documented limitation rather than an oversight.
+        self.conversation_id = conversation_id
         self._get_active = active_document_provider or (lambda: None)
         self._set_active = active_document_setter or (lambda _f: None)
 
@@ -161,7 +171,9 @@ class ReportTool:
                 return context
 
         try:
-            result = report_service.generate_topic_report(topic, document=resolved_document)
+            result = report_service.generate_topic_report(
+                topic, self.conversation_id, document=resolved_document
+            )
         except ValueError as e:
             # Includes the "not enough information about this topic" case —
             # surfaced as-is instead of generating a hallucinated report.

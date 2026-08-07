@@ -42,6 +42,35 @@ log = logging.getLogger("llm_provider")
 _client: Optional[Groq] = None
 
 
+def _log_outgoing_messages(model: str, messages: List[dict]) -> None:
+    """
+    TEMPORARY — conversation-history integrity investigation only, not a
+    permanent feature. Logs the EXACT `messages` list about to be sent to
+    Groq for this call, one "Role: ..." block per entry, so the real
+    on-the-wire request can be inspected directly instead of inferred from
+    reading code. This is the single choke point every Groq call in the
+    app goes through (agent.llm's planner, rag_service's query rewrite /
+    translate / generate / respond / summarize / compare, memory's fact
+    extractor, report_service's map/reduce), so one log line here covers
+    all of them uniformly.
+
+    Gated behind AGENT_DEBUG (same flag agent.py's existing _debug_step
+    uses) and emitted at DEBUG level, so it is silent by default — set
+    AGENT_DEBUG=true AND the logger level to DEBUG to see it. Safe to
+    delete once the investigation is closed out; it does not change any
+    request behavior, only observes it.
+    """
+    if not settings.AGENT_DEBUG:
+        return
+    lines = [f"[history-debug] ---- outgoing Groq request (model={model!r}) ----"]
+    for m in messages:
+        lines.append(f"Role: {m.get('role')}")
+        lines.append(str(m.get("content")))
+        lines.append("")
+    lines.append("[history-debug] ---- end of request ----")
+    log.debug("\n".join(lines))
+
+
 def _get_client() -> Groq:
     global _client
     if _client is None:
@@ -93,6 +122,8 @@ class GroqLLM:
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
+        _log_outgoing_messages(self.model, messages)
+
         try:
             response = client.chat.completions.create(**kwargs)
         except Exception as e:
@@ -124,6 +155,8 @@ class GroqLLM:
             top_p=self.top_p,
             stream=True,
         )
+
+        _log_outgoing_messages(self.model, messages)
 
         try:
             stream = client.chat.completions.create(**kwargs)

@@ -107,12 +107,13 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<Response>
 
 export async function askQuestion(
   query: string,
-  language: Language = "auto"
+  language: Language = "auto",
+  conversationId: string
 ): Promise<ChatResponse> {
   const res = await apiFetch("/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, language }),
+    body: JSON.stringify({ query, language, conversation_id: conversationId }),
   });
 
   return res.json();
@@ -120,11 +121,13 @@ export async function askQuestion(
 
 export async function askVoice(
   audioBlob: Blob,
-  language: Language = "auto"
+  language: Language = "auto",
+  conversationId: string
 ): Promise<ChatResponse> {
   const form = new FormData();
   form.append("audio", audioBlob, "recording.webm");
   form.append("language", language);
+  form.append("conversation_id", conversationId);
 
   const res = await apiFetch("/chat/voice", {
     method: "POST",
@@ -134,8 +137,10 @@ export async function askVoice(
   return res.json();
 }
 
-export async function resetConversation(): Promise<void> {
-  await apiFetch("/chat/reset", { method: "POST" });
+export async function resetConversation(conversationId: string): Promise<void> {
+  await apiFetch(`/chat/reset?conversation_id=${encodeURIComponent(conversationId)}`, {
+    method: "POST",
+  });
 }
 
 const UPLOAD_POLL_INTERVAL_MS = 1000;
@@ -144,9 +149,14 @@ const UPLOAD_POLL_INTERVAL_MS = 1000;
 // itself (which keeps running regardless).
 const UPLOAD_POLL_TIMEOUT_MS = 15 * 60_000;
 
-async function startUploadJob(files: File[]): Promise<{ job_id: string }> {
+async function startUploadJob(files: File[], conversationId: string): Promise<{ job_id: string }> {
   const form = new FormData();
   files.forEach((f) => form.append("files", f));
+  // Required — every uploaded document is tagged with this conversation_id
+  // server-side and only ever retrievable within it (see Document
+  // Isolation). No fallback: an upload with no owning conversation_id
+  // would either be rejected or, worse, silently land in the wrong scope.
+  form.append("conversation_id", conversationId);
 
   const res = await apiFetch("/upload", {
     method: "POST",
@@ -170,9 +180,10 @@ async function getUploadJobStatus(jobId: string): Promise<UploadJobStatus> {
  */
 export async function uploadFiles(
   files: File[],
+  conversationId: string,
   onStage?: (stage: UploadStage) => void
 ): Promise<UploadJobStatus> {
-  const { job_id } = await startUploadJob(files);
+  const { job_id } = await startUploadJob(files, conversationId);
 
   const deadline = Date.now() + UPLOAD_POLL_TIMEOUT_MS;
   let lastStage: UploadStage | null = null;
@@ -260,7 +271,7 @@ export interface StreamChatHandlers {
 export function streamChat(
   query: string,
   language: Language,
-  conversationId: string | undefined,
+  conversationId: string,
   handlers: StreamChatHandlers
 ): () => void {
   const socket = new WebSocket(wsUrl());
@@ -274,9 +285,11 @@ export function streamChat(
   };
 
   socket.onopen = () => {
-    socket.send(
-      JSON.stringify({ query, language, conversation_id: conversationId ?? "default" })
-    );
+    // No fallback to a shared "default" id: conversationId is this tab's
+    // own identity (see lib/conversation.ts) and must always be real —
+    // silently defaulting here is exactly what let unrelated conversations
+    // merge (see Issue 2 investigation).
+    socket.send(JSON.stringify({ query, language, conversation_id: conversationId }));
   };
 
   socket.onmessage = (event) => {

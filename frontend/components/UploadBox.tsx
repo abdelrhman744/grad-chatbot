@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { UploadCloud, Download, FolderOpen, CheckCircle2, XCircle, RotateCcw } from "lucide-react";
 import { uploadFiles, getStoredFiles, StoredFile, UploadStage } from "@/services/api";
+import { getConversationId } from "@/lib/conversation";
 import { getFileTypeMeta } from "@/lib/fileTypeMeta";
 import Card from "@/components/ui/Card";
 import Badge from "@/components/ui/Badge";
@@ -38,6 +39,10 @@ function relativeTime(iso: string | null | undefined): string {
 }
 
 export default function UploadBox({ onUploaded }: Props) {
+  // This tab's own conversation id (see lib/conversation.ts) — every file
+  // uploaded here is tagged with it server-side and only ever retrievable
+  // within this conversation (see Document Isolation).
+  const [conversationId] = useState<string>(() => getConversationId());
   const [dragging, setDragging] = useState(false);
   const [loading, setLoading] = useState(false);
   const [stage, setStage] = useState<UploadStage | null>(null);
@@ -69,7 +74,7 @@ export default function UploadBox({ onUploaded }: Props) {
       setStage("queued");
       setLastFiles(selected);
       try {
-        const result = await uploadFiles(selected, setStage);
+        const result = await uploadFiles(selected, conversationId, setStage);
         if (result.status === "error") {
           setStatus({ ok: false, msg: result.error || "Upload failed." });
         } else {
@@ -86,7 +91,7 @@ export default function UploadBox({ onUploaded }: Props) {
         setStage(null);
       }
     },
-    [onUploaded, refreshFiles]
+    [onUploaded, refreshFiles, conversationId]
   );
 
   const retry = useCallback(() => {

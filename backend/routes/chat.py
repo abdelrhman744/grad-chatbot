@@ -8,7 +8,7 @@ from typing import Literal
 from agent.session import get_agent, reset_agent
 from config import settings
 from services.audio_service import transcribe_audio
-from services.rag_service import build_sources_from_dicts
+from services.rag_service import build_sources_from_dicts, delete_conversation_documents
 from utils import timing
 
 log = logging.getLogger("routes.chat")
@@ -32,7 +32,10 @@ def _error_detail(e: Exception) -> str:
 class ChatRequest(BaseModel):
     query: str
     language: Literal["auto", "ar", "en"] = "auto"
-    conversation_id: str = settings.DEFAULT_CONVERSATION_ID
+    # No default: every caller must own and send a real conversation_id (see
+    # frontend/lib/conversation.ts). A default here is exactly the silent
+    # fallback that let unrelated conversations merge — see Issue 2.
+    conversation_id: str
 
 
 def _run_agent(query: str, language: str, conversation_id: str) -> dict:
@@ -90,7 +93,8 @@ async def chat(request: ChatRequest):
 async def chat_voice(
     audio: UploadFile = File(...),
     language: str = Form("auto"),
-    conversation_id: str = Form(settings.DEFAULT_CONVERSATION_ID),
+    # No default — see ChatRequest.conversation_id above.
+    conversation_id: str = Form(...),
 ):
     """Transcribe uploaded audio then answer the question via the agent."""
     try:
@@ -120,7 +124,21 @@ async def chat_voice(
 
 
 @router.post("/chat/reset")
-async def chat_reset(conversation_id: str = settings.DEFAULT_CONVERSATION_ID):
-    """Clear short-term and long-term memory for a conversation."""
+async def chat_reset(conversation_id: str):
+    """
+    Clear short-term/long-term memory AND this conversation's indexed
+    documents. No default — resets exactly the one conversation_id
+    supplied, never a shared/fallback id (see ChatRequest.conversation_id
+    above).
+
+    Document removal is a REAL Qdrant deletion (see
+    rag_service.delete_conversation_documents), scoped by the same
+    conversation_id filter used at retrieval time, so it can only ever
+    affect this conversation_id's own chunks — see Document Isolation.
+    """
     reset_agent(conversation_id)
-    return {"message": "Conversation memory cleared."}
+    documents_removed = delete_conversation_documents(conversation_id)
+    return {
+        "message": "Conversation memory and documents cleared.",
+        "documents_removed": documents_removed,
+    }

@@ -2,7 +2,9 @@
 
 An **agentic, bilingual (Arabic/English) Retrieval-Augmented Generation system**
 for chatting with your own documents — LLM generation via the **Groq API**,
-local **Qdrant** vector storage, and a configurable embeddings provider.
+**Qdrant** vector storage (run as its own Docker container, server mode —
+see [`docker-compose.yml`](docker-compose.yml)), and a configurable
+embeddings provider.
 
 Upload PDFs, Word docs, Excel spreadsheets/CSVs, text, JSON, or scanned
 images; ask questions by typing or by voice; get grounded, cited answers
@@ -106,19 +108,18 @@ Three additions on top of the original agentic RAG pipeline:
   `backend/agent/tools/report_tool.py`, `backend/services/report_service.py`,
   and `backend/agent/prompt.py` (tool #6, "report").
 
-**Setup for these three:**
+**Setup — the whole stack (Qdrant + MinIO + backend + frontend) runs in
+Docker; see [Section 5a](#5a-running-with-docker-compose-recommended) for
+the full quickstart:**
 
 ```bash
-# 1. Start MinIO (uploads + generated reports bucket)
-docker compose up -d
-# Console: http://localhost:9001  (minioadmin / minioadmin)
-
-# 2. Install the new backend deps (already in requirements.txt)
-pip install -r backend/requirements.txt
-
-# 3. Copy env files and adjust if needed
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env.local   # optional, only if backend isn't on :8000
+cp .env.example .env                    # Compose-level vars (MinIO creds, Qdrant image tag)
+cp backend/.env.example backend/.env     # fill in GROQ_API_KEY at minimum
+docker compose up --build
+# Frontend:      http://localhost:3000
+# Backend:       http://localhost:8000/api/health
+# MinIO console: http://localhost:9001  (minioadmin / minioadmin by default)
+# Qdrant REST:   http://localhost:6333
 ```
 
 > **MinIO is optional at runtime.** The backend still starts, and
@@ -128,7 +129,13 @@ cp frontend/.env.example frontend/.env.local   # optional, only if backend isn't
 > Without it, uploaded originals aren't stored (`download_url` comes back
 > `null` for those files) and PDF report generation/download return
 > `503 Service Unavailable`, since both need the original file bytes.
-> Run `docker compose up -d` and restart the backend to enable them.
+>
+> **Qdrant is NOT optional** — it's the vector store retrieval/chat
+> depend on. Unlike MinIO, the backend retries connecting to it on
+> startup and after transient failures (see `services/db_service.py`),
+> but degrades to "no documents retrievable" rather than crashing if it
+> stays unreachable; `GET /api/health` reports `"qdrant": "unreachable"`
+> in that case.
 
 No extra setup is needed for streaming — `/ws/chat` is served by the same
 FastAPI app as the REST routes.
@@ -152,8 +159,10 @@ without re-explaining context every turn.
 download or GPU required), embeddings run on a **configurable provider**
 (a local, free, CPU-friendly HuggingFace/sentence-transformers model by
 default, or OpenAI's hosted embeddings API as an alternative), vectors are
-stored in a local/embedded **Qdrant** instance, **Whisper** handles
-speech-to-text, and Tesseract/OpenCV handle OCR on scanned PDFs and images.
+stored in **Qdrant running as its own server** (Docker container in
+development/production — see `docker-compose.yml` — or any Qdrant server
+reachable at `QDRANT_URL`), **Whisper** handles speech-to-text, and
+Tesseract/OpenCV handle OCR on scanned PDFs and images.
 
 > This project previously used Ollama for both LLM generation and embeddings.
 > It has been fully migrated to Groq + a configurable embeddings provider;
@@ -209,7 +218,9 @@ speech-to-text, and Tesseract/OpenCV handle OCR on scanned PDFs and images.
 ```
 React / Next.js UI
     ↓  fetch("/api/chat")
-Next.js rewrite proxy  (next.config.js → http://localhost:8000)
+Next.js rewrite proxy  (next.config.js → BACKEND_INTERNAL_URL,
+                         e.g. http://backend:8000 in Docker,
+                         http://localhost:8000 for native dev)
     ↓
 FastAPI  /api/chat
     ↓
@@ -276,23 +287,74 @@ ai-doc-assistant/
 │       ├── report_service.py       Map-reduce summarization + PDF rendering
 │       ├── audio_service.py        Whisper transcription
 │       └── ocr_service.py          Tesseract/OpenCV OCR
-├── docker-compose.yml              Local MinIO instance
+│   ├── Dockerfile                  Multi-stage build (venv builder → slim runtime)
+│   └── .dockerignore
+├── docker-compose.yml              Full stack: qdrant + minio + backend + frontend
+├── .env.example                    Compose-level vars (MinIO creds, Qdrant image tag)
 └── frontend/
     ├── app/                        Next.js App Router pages
     ├── components/                 ChatBox, AnswerBox, SourceBox, UploadBox, VoiceRecorder
     ├── services/api.ts             Typed fetch wrapper + WebSocket streamChat()
-    └── next.config.js              Dev-time rewrite: /api/* → http://localhost:8000/api/*
+    ├── next.config.js              Rewrite: /api/* → BACKEND_INTERNAL_URL/api/* (standalone output)
+    ├── Dockerfile                  Multi-stage build (deps → build → standalone runtime)
+    └── .dockerignore
 ```
 
 ---
 
 ## 5. Installation
 
+### 5a. Running with Docker Compose (recommended)
+
+The only prerequisites are Docker and Docker Compose — everything else
+(Python, Node, Qdrant, MinIO, ffmpeg, tesseract) runs inside the four
+containers `docker-compose.yml` defines.
+
+```bash
+cp .env.example .env                    # Compose-level vars — MinIO creds, Qdrant image tag
+cp backend/.env.example backend/.env    # fill in GROQ_API_KEY at minimum
+docker compose up --build
+```
+
+> ⚠️ **Rotate your Groq API key before relying on this for anything real.**
+> `backend/.env.example`'s history in this repo has, at times, shipped
+> with a real-looking key checked in as the default value. `backend/.env`
+> itself is git-ignored (never committed), but if you ever copied that
+> key into a real deployment, generate a fresh one at
+> https://console.groq.com/keys and use that instead.
+
+This builds and starts, in dependency order (each gated on the previous
+being *healthy*, not just started):
+
+1. `qdrant` — vector store, REST on `:6333`, gRPC on `:6334`, data in a
+   named volume (`qdrant_data`).
+2. `minio` — object storage, API on `:9000`, console on `:9001`, data in
+   `minio_data`.
+3. `backend` — FastAPI, `:8000`, waits for both of the above to report
+   healthy before it even starts; model weights (sentence-transformers,
+   cross-encoder, Whisper) download on first boot into a `backend_model_cache`
+   volume, not into the image, so they persist across `--build`s.
+4. `frontend` — Next.js (standalone build), `:3000`, waits for the
+   backend to report healthy.
+
+Open `http://localhost:3000`. Tear down with `docker compose down`
+(add `-v` to also delete the named volumes, i.e. wipe all indexed
+documents/objects).
+
+**Native (non-Docker) Qdrant/MinIO, Dockerized app:** point
+`QDRANT_URL`/`MINIO_ENDPOINT` in `backend/.env` at wherever they're
+actually running instead of `qdrant`/`minio`, and remove those two
+services from `docker-compose.yml` (or just don't start them).
+
+### 5b. Native (non-Docker) Installation
+
 ### Prerequisites
 
 - Python 3.10+
 - Node.js 18+
 - `ffmpeg` and `tesseract` on your PATH (for voice input and OCR)
+- A locally-running Qdrant server (`docker run -p 6333:6333 -p 6334:6334
+  qdrant/qdrant:v1.19.0`, or any Qdrant instance reachable at `QDRANT_URL`)
 - A [Groq API key](https://console.groq.com/keys) (free tier available)
 
 ### Backend
@@ -347,19 +409,27 @@ Nothing is hardcoded in source — every key below is read via `config.py`.
 | `OPENAI_API_KEY`       | *(empty)*                                                              | Required only if `EMBEDDING_PROVIDER=openai`.            |
 
 > ⚠️ If you change `EMBEDDING_PROVIDER` or `EMBEDDING_MODEL` after documents
-> have already been ingested, delete the Qdrant collection (or point
-> `QDRANT_PATH`/`QDRANT_COLLECTION` at a fresh path) and re-upload — vectors
-> from different embedding models are not compatible with each other.
+> have already been ingested, the existing Qdrant collection's vector
+> dimension won't match anymore. `ensure_collection()` in
+> `backend/services/db_service.py` detects this on startup and raises a
+> clear error rather than silently deleting/recreating the collection —
+> either delete the collection yourself (Qdrant's REST API or the
+> `qdrant_data` volume) or point `QDRANT_COLLECTION` at a fresh name, then
+> re-upload. Vectors from different embedding models are never compatible.
 
 ### Vector store / RAG / Audio / Agent / Memory
 
-See `backend/.env.example` for the full list (Qdrant path/collection,
+See `backend/.env.example` for the full list (Qdrant URL/collection,
 chunking, retrieval `k`, OCR toggle, Whisper model size, agent iteration
 limit, memory window sizes, etc.) — all have sensible defaults and rarely
 need to change. Notable additions:
 
 | Variable                   | Default                                        | Description                                                                 |
 |-----------------------------|-------------------------------------------------|-------------------------------------------------------------------------------|
+| `QDRANT_URL`                | `http://localhost:6333`                        | Qdrant server address. `docker-compose.yml` overrides this to `http://qdrant:6333` for the backend container. |
+| `QDRANT_CONNECT_RETRIES`    | `5`                                             | Bounded retry attempts for Qdrant operations (startup attach, collection checks, deletes). |
+| `QDRANT_RETRY_DELAY_SECONDS`| `2`                                             | Delay between retry attempts.                                              |
+| `FRONTEND_ORIGIN`           | `http://localhost:3000`                        | Comma-separated CORS allowlist — the frontend origin(s) allowed to call the API with credentials. |
 | `QUERY_EXPANSION_ENABLED`   | `true`                                          | Adds same-language synonym/concept query variants for semantic questions.  |
 | `RERANK_USE_CROSS_ENCODER`  | `true`                                          | Blend a semantic cross-encoder score into reranking (falls back to lexical-only if the model can't load). |
 | `CROSS_ENCODER_MODEL`       | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`    | Multilingual, CPU-friendly, no API key.                                    |
@@ -417,6 +487,11 @@ completely unaffected by which one you choose.
 ---
 
 ## 9. Running the Backend
+
+> Using Docker Compose (`docker compose up --build`)? This and the next
+> section don't apply — the backend/frontend are already running as
+> containers. This is the native (non-Docker) path, requiring a Qdrant
+> server already reachable at `QDRANT_URL` (see [5b](#5b-native-non-docker-installation)).
 
 ```bash
 cd backend
@@ -535,10 +610,24 @@ first use. Reducing `AGENT_MAX_ITERATIONS` or using a smaller/faster
 `AGENT_MODEL` for planning will reduce this further.
 
 **Embeddings dimension mismatch / Qdrant errors after switching providers**
-Different embedding models produce vectors of different sizes. If you
-change `EMBEDDING_PROVIDER` or `EMBEDDING_MODEL` after documents are
-already indexed, delete `QDRANT_PATH` (or point it at a new empty
-directory) and re-upload your documents.
+Different embedding models produce vectors of different sizes.
+`ensure_collection()` (`backend/services/db_service.py`) checks this on
+startup and raises a clear `RuntimeError` naming both the found and
+expected schema instead of silently deleting/recreating anything — delete
+the Qdrant collection yourself (or point `QDRANT_COLLECTION` at a new
+name) and re-upload your documents.
+
+**`GET /api/health` reports `"qdrant": "unreachable"`**
+Under Docker Compose: `docker compose ps` — is the `qdrant` container
+healthy? `docker compose logs qdrant`. The backend's `depends_on:
+condition: service_healthy` should keep it from starting before Qdrant is
+up, but if Qdrant crashes *after* the backend started, retrieval/chat
+will fail until it's back — the backend retries (`QDRANT_CONNECT_RETRIES`
+/ `QDRANT_RETRY_DELAY_SECONDS`) rather than crashing, so restarting the
+`qdrant` container alone (`docker compose restart qdrant`) is usually
+enough to recover, no backend restart needed.
+Native (non-Docker): confirm `QDRANT_URL` in `backend/.env` actually
+points at a running Qdrant server.
 
 **"No relevant documents were found" for everything**
 Confirm at least one file was successfully uploaded (`GET
@@ -547,12 +636,18 @@ check the backend startup log for `Loaded existing DB — N vectors`.
 
 **Voice input fails**
 Ensure `ffmpeg` and `tesseract` are installed and on your PATH, or set
-`FFMPEG_PATH` / `TESSERACT_CMD` explicitly in `.env`.
+`FFMPEG_PATH` / `TESSERACT_CMD` explicitly in `.env`. Under Docker Compose
+these are already installed in the backend image and set via
+`docker-compose.yml`'s `environment:` block — this only applies to native
+(non-Docker) setups.
 
 **CORS errors when calling the backend directly (bypassing the Next.js
 proxy)**
-`main.py` allows all origins by default (`allow_origins=["*"]`) — if
-you've changed this for production, add your frontend's origin explicitly.
+`main.py` restricts origins to `FRONTEND_ORIGIN` (default
+`http://localhost:3000`) — a comma-separated allowlist, not a wildcard
+(browsers reject `allow_origins=["*"]` combined with
+`allow_credentials=True` anyway). If you're calling the API from a
+different origin, add it to `FRONTEND_ORIGIN` in `backend/.env`.
 
 ---
 

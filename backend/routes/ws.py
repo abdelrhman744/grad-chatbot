@@ -32,7 +32,6 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from agent.session import get_agent
-from config import settings
 
 log = logging.getLogger("routes.ws")
 
@@ -55,7 +54,18 @@ async def ws_chat(websocket: WebSocket):
 
             query = (payload.get("query") or "").strip()
             language = payload.get("language", "auto")
-            conversation_id = payload.get("conversation_id", settings.DEFAULT_CONVERSATION_ID)
+            # No fallback to a shared/default id: every client owns one
+            # conversation_id for its lifetime (see frontend/lib/conversation.ts)
+            # and must send it on every message. Silently defaulting here is
+            # exactly the bug that let unrelated conversations merge — see the
+            # Issue 2 investigation.
+            conversation_id = (payload.get("conversation_id") or "").strip()
+
+            if not conversation_id:
+                await websocket.send_json(
+                    {"type": "error", "message": "conversation_id is required."}
+                )
+                continue
 
             if not query:
                 await websocket.send_json({"type": "error", "message": "Query cannot be empty."})
