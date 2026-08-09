@@ -14,6 +14,26 @@ compare what it has found.
 
 ---
 
+## What's New: Handwritten OCR (Arabic + English, free & local)
+
+- ✍️ **Handwritten OCR** — `POST /api/ocr/handwritten` recognizes Arabic or
+  English handwriting from an uploaded image using Hugging Face `transformers`
+  (TrOCR) — entirely local/free, no paid or external OCR API. Models
+  (`microsoft/trocr-base-handwritten` for English,
+  `RayR1/trocr-base-arabic-handwritten` for Arabic) download automatically on
+  first use and are cached under the same Hugging Face cache the embedding/
+  Whisper models already persist through (`backend_model_cache` in
+  `docker-compose.yml` — no new volume needed). Separate from, and does not
+  replace, the existing Tesseract-based printed-text OCR used by the upload
+  pipeline. A "Handwritten OCR" button in the app header opens a modal to
+  upload an image, pick a language, run OCR, and copy the result (right-to-left
+  for Arabic). Extracted text can optionally be indexed into the same chunk →
+  embed → Qdrant pipeline as any other upload. Full details, limitations
+  (single-line images work best — no page-layout detector), and Docker/caching
+  behavior: [`backend/HANDWRITTEN_OCR.md`](backend/HANDWRITTEN_OCR.md).
+
+---
+
 ## What's New: Excel/CSV Ingestion, Modular Loaders, Redesigned UI
 
 - 📊 **Excel/CSV ingestion** — `.xlsx`, `.xls`, and `.csv` files are now
@@ -277,6 +297,7 @@ ai-doc-assistant/
 │   │   ├── ws.py                   /ws/chat — streaming WebSocket chat
 │   │   ├── upload.py               /api/upload, /api/stored-files, file download
 │   │   ├── reports.py              /api/reports/generate, report download
+│   │   ├── ocr.py                  /api/ocr/handwritten (see backend/HANDWRITTEN_OCR.md)
 │   │   └── health.py               /api/health
 │   └── services/
 │       ├── rag_service.py          Core RAG pipeline (ingest, retrieve, prompt, generate)
@@ -286,14 +307,16 @@ ai-doc-assistant/
 │       ├── storage_service.py      MinIO object storage wrapper
 │       ├── report_service.py       Map-reduce summarization + PDF rendering
 │       ├── audio_service.py        Whisper transcription
-│       └── ocr_service.py          Tesseract/OpenCV OCR
+│       ├── ocr_service.py          Tesseract/OpenCV OCR (printed text)
+│       └── handwritten_ocr_service.py  Hugging Face TrOCR (handwritten Arabic/English)
+│   ├── HANDWRITTEN_OCR.md          Handwritten OCR feature docs
 │   ├── Dockerfile                  Multi-stage build (venv builder → slim runtime)
 │   └── .dockerignore
 ├── docker-compose.yml              Full stack: qdrant + minio + backend + frontend
 ├── .env.example                    Compose-level vars (MinIO creds, Qdrant image tag)
 └── frontend/
     ├── app/                        Next.js App Router pages
-    ├── components/                 ChatBox, AnswerBox, SourceBox, UploadBox, VoiceRecorder
+    ├── components/                 ChatBox, AnswerBox, SourceBox, UploadBox, VoiceRecorder, HandwrittenOcrModal
     ├── services/api.ts             Typed fetch wrapper + WebSocket streamChat()
     ├── next.config.js              Rewrite: /api/* → BACKEND_INTERNAL_URL/api/* (standalone output)
     ├── Dockerfile                  Multi-stage build (deps → build → standalone runtime)

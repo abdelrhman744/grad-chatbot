@@ -86,9 +86,13 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # HF/torch/sentence-transformers/Whisper model cache — persisted so
-      # models download once, not on every `--build`. Never baked into
-      # the image itself.
+      # HF/torch/sentence-transformers/Whisper/TrOCR (handwritten OCR)
+      # model cache — persisted so models download once, not on every
+      # `--build`. Never baked into the image itself. Hugging Face's
+      # default cache dir (~/.cache/huggingface) resolves to
+      # /root/.cache/huggingface inside this container, which falls under
+      # this same mount — no extra volume needed for the handwritten OCR
+      # models (see services/handwritten_ocr_service.py).
       - backend_model_cache:/root/.cache
       # Runtime state that predates this migration; bind-mounted so it
       # survives container rebuilds same as it survived local restarts.

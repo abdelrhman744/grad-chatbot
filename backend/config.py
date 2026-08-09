@@ -216,6 +216,26 @@ class Settings:
     FFMPEG_PATH: str = os.getenv("FFMPEG_PATH", "ffmpeg")
     TESSERACT_CMD: str = os.getenv("TESSERACT_CMD", "tesseract")
 
+    # ── Handwritten OCR (TrOCR, local via Hugging Face `transformers`) ────
+    # Free/local/offline-capable handwriting recognition — separate from the
+    # printed-text OCR above (Tesseract, still used for scanned PDFs/images
+    # in the upload pipeline). See services/handwritten_ocr_service.py.
+    # Both models are downloaded automatically by `transformers` on first
+    # use and cached under the standard Hugging Face cache dir (~/.cache/
+    # huggingface — already persisted by docker-compose.yml's
+    # `backend_model_cache` volume, same as the embedding/Whisper models);
+    # no manual download and no local path hardcoding.
+    HANDWRITTEN_OCR_EN_MODEL: str = os.getenv(
+        "HANDWRITTEN_OCR_EN_MODEL", "microsoft/trocr-base-handwritten"
+    )
+    HANDWRITTEN_OCR_AR_MODEL: str = os.getenv(
+        "HANDWRITTEN_OCR_AR_MODEL", "RayR1/trocr-base-arabic-handwritten"
+    )
+    # Upper bound on generated tokens per OCR call — TrOCR models target
+    # single text-line images, so this only needs to comfortably cover one
+    # line/short passage, not a full page.
+    HANDWRITTEN_OCR_MAX_NEW_TOKENS: int = _int("HANDWRITTEN_OCR_MAX_NEW_TOKENS", 256)
+
     # ── Agent ────────────────────────────────────────────────────────────
     AGENT_MAX_ITERATIONS: int = _int("AGENT_MAX_ITERATIONS", 6)
     AGENT_DEBUG: bool = _bool("AGENT_DEBUG", False)

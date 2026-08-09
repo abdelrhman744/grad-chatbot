@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Sparkles, RotateCcw, PanelLeftClose, PanelLeft, X } from "lucide-react";
+import { Sparkles, RotateCcw, PanelLeftClose, PanelLeft, X, ScanText } from "lucide-react";
 import ChatBox from "@/components/ChatBox";
 import UploadBox from "@/components/UploadBox";
+import HandwrittenOcrModal from "@/components/HandwrittenOcrModal";
 import Card from "@/components/ui/Card";
 import { checkHealth } from "@/services/api";
 
@@ -12,6 +13,7 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [uploadNote, setUploadNote] = useState<string>("");
   const [resetSignal, setResetSignal] = useState(0);
+  const [ocrOpen, setOcrOpen] = useState(false);
 
   useEffect(() => {
     checkHealth().then(setHealthy);
@@ -131,7 +133,18 @@ export default function Home() {
 
           <h1 className="text-sm font-semibold text-ink">Document Chat</h1>
 
-          <div className="ml-auto text-xs text-subtle font-mono hidden sm:block">
+          <button
+            onClick={() => setOcrOpen(true)}
+            className="ml-auto flex items-center gap-1.5 h-8 px-3 rounded-lg
+              text-xs font-medium text-muted bg-surface-2 hover:text-ink hover:bg-surface-3
+              border border-transparent hover:border-border-light transition-all"
+            title="Extract text from a handwritten image (Arabic or English)"
+          >
+            <ScanText className="w-3.5 h-3.5" />
+            Handwritten OCR
+          </button>
+
+          <div className="text-xs text-subtle font-mono hidden sm:block">
             Document Analysis · Intelligent Search
           </div>
         </header>
@@ -140,6 +153,8 @@ export default function Home() {
           <ChatBox resetSignal={resetSignal} />
         </div>
       </main>
+
+      <HandwrittenOcrModal open={ocrOpen} onClose={() => setOcrOpen(false)} />
     </div>
   );
 }
