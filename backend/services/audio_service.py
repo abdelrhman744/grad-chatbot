@@ -165,49 +165,46 @@ def transcribe_audio(audio_bytes: bytes, language: Optional[str] = None) -> str:
 
         forced_lang = language if language in {"ar", "en"} else None
 
+        # Whisper's own default is a temperature *fallback schedule*, not a
+        # single value: it retries decoding at progressively higher
+        # temperatures whenever a decode fails its internal quality gates
+        # (compression_ratio_threshold / logprob_threshold) — very common on
+        # real microphone audio. A bare 0.0 disables that retry entirely
+        # (one failed attempt = final result) and silently turns best_of
+        # into a no-op, since best_of only applies when temperature > 0.
         base_kwargs = {
             "fp16": False,
             "task": "transcribe",
-            "temperature": 0.0,
+            "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
             "condition_on_previous_text": False,
             "beam_size": 5,
             "best_of": 5,
         }
 
-        # Manual language selection: force selected language.
         if forced_lang:
-            result = model.transcribe(
-                converted_path,
-                language=forced_lang,
-                initial_prompt=_initial_prompt(forced_lang),
-                **base_kwargs,
-            )
+            # Manual language selection: force the selected language.
+            resolved_lang = forced_lang
         else:
-            # Auto mode: let Whisper detect language so English does not get forced to Arabic.
-            result = model.transcribe(converted_path, **base_kwargs)
+            # Auto mode: decide the language ONCE with a cheap encoder-only
+            # language-ID pass (_detect_language — a single forward pass,
+            # no decoding) instead of trusting whatever Whisper's own
+            # unprompted transcribe pass happens to guess. The previous
+            # implementation only gave Arabic its dialect-tuned prompt when
+            # an unprompted first pass already said "ar", so a misdetected
+            # first guess silently skipped Arabic handling entirely. This
+            # also avoids ever running two full transcribe passes: exactly
+            # one full pass happens below, in every mode.
+            resolved_lang = _detect_language(converted_path)
 
-            detected_auto = result.get("language", "auto")
-            text_auto = (result.get("text") or "").strip()
-
-            # If Whisper detected Arabic, run one Arabic-guided pass to improve Egyptian Arabic words.
-            # This does not affect English because it only happens after Whisper says the audio is Arabic.
-            if detected_auto == "ar":
-                try:
-                    result_ar = model.transcribe(
-                        converted_path,
-                        language="ar",
-                        initial_prompt=_initial_prompt("ar"),
-                        **base_kwargs,
-                    )
-                    text_ar = (result_ar.get("text") or "").strip()
-
-                    if len(text_ar) >= max(3, int(len(text_auto) * 0.6)):
-                        result = result_ar
-                except Exception as e:
-                    log.warning(f"Arabic second-pass transcription failed: {e}")
+        result = model.transcribe(
+            converted_path,
+            language=resolved_lang,
+            initial_prompt=_initial_prompt(resolved_lang),
+            **base_kwargs,
+        )
 
         text = (result.get("text") or "").strip()
-        detected_lang = result.get("language", forced_lang or "auto")
+        detected_lang = result.get("language", resolved_lang)
 
         if not text:
             raise RuntimeError("No speech detected in audio.")

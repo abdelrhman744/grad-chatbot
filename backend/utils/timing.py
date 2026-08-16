@@ -52,6 +52,7 @@ class RequestTimer:
         self._start_wall = time.time()
         self.stages: List[tuple] = []     # [(name, ms), ...] in call order (top-level only)
         self.notes: dict = {}             # name -> cumulative ms (top-level stages + substages)
+        self.marks: dict = {}             # name -> elapsed ms since start, at a single instant
 
     def record_stage(self, name: str, ms: float) -> None:
         self.stages.append((name, ms))
@@ -59,6 +60,24 @@ class RequestTimer:
 
     def record_substage(self, name: str, ms: float) -> None:
         self.notes[name] = self.notes.get(name, 0.0) + ms
+
+    def mark(self, name: str) -> float:
+        """
+        Record a point-in-time marker (elapsed ms since this timer's
+        start) — for events that are a single INSTANT rather than a
+        measured code block (e.g. "first streamed token was ready to
+        send"), which stage()/substage() aren't a good fit for since they
+        time a `with`-block's duration, not a point in time. Callers
+        derive their own durations from pairs of marks (e.g.
+        marks["stream_end"] - marks["first_token"]) — this method only
+        ever does a plain dict assignment (safe for concurrent calls with
+        DIFFERENT names from different threads, same reasoning as
+        record_stage/record_substage; do not call it with the SAME name
+        from two threads at once). Returns the recorded elapsed ms.
+        """
+        elapsed = self.total_ms()
+        self.marks[name] = elapsed
+        return elapsed
 
     def total_ms(self) -> float:
         return (time.perf_counter() - self._start) * 1000

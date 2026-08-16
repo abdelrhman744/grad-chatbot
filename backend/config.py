@@ -215,6 +215,66 @@ class Settings:
     SILENCE_THRESHOLD_DB: float = _float("SILENCE_THRESHOLD_DB", -60.0)
     FFMPEG_PATH: str = os.getenv("FFMPEG_PATH", "ffmpeg")
     TESSERACT_CMD: str = os.getenv("TESSERACT_CMD", "tesseract")
+    # Bounded page-level parallelism for Tesseract OCR (services/ocr_service.py).
+    # Each concurrent page spawns its own Tesseract subprocess, so this
+    # directly caps how many Tesseract processes can run at once — keep it
+    # modest on shared/weak servers regardless of page count or CPU count.
+    OCR_MAX_CONCURRENT_PAGES: int = _int("OCR_MAX_CONCURRENT_PAGES", 4)
+    # A page/image's first (cheapest) OCR attempt is accepted as-is once its
+    # extracted text clears this length — only then does the full
+    # preprocessing-strategy x PSM-mode sweep run (see
+    # ocr_service._ocr_image_tiered). Same value PyPDFLoader's own
+    # whole-document text-length check already used (unchanged threshold,
+    # now also reused per-page — see loaders/pdf_loader.py).
+    OCR_MIN_TEXT_CHARS: int = _int("OCR_MIN_TEXT_CHARS", 20)
+    # Minimum fraction of non-whitespace characters that must be
+    # alphanumeric (Arabic or Latin letters, digits) for a first-attempt
+    # OCR result to be trusted without escalating to the full sweep — cheap
+    # guard against accepting sparse/garbled noise from a single pass.
+    OCR_MIN_ALNUM_RATIO: float = _float("OCR_MIN_ALNUM_RATIO", 0.6)
+
+    # ── Handwritten OCR (TrOCR, local via Hugging Face `transformers`) ────
+    # Free/local/offline-capable handwriting recognition — separate from the
+    # printed-text OCR above (Tesseract, still used for scanned PDFs/images
+    # in the upload pipeline). See services/handwritten_ocr_service.py.
+    # Both models are downloaded automatically by `transformers` on first
+    # use and cached under the standard Hugging Face cache dir (~/.cache/
+    # huggingface — already persisted by docker-compose.yml's
+    # `backend_model_cache` volume, same as the embedding/Whisper models);
+    # no manual download and no local path hardcoding.
+    #
+    # English default changed base -> small after evaluate_handwritten_ocr.py
+    # (Tasks 2/6): on real IAM handwriting-line samples, run through the
+    # SAME preprocessing pipeline, trocr-small-handwritten matched
+    # trocr-base-handwritten's accuracy (CER 0.253 vs 0.248 — within noise
+    # over a 6-sample benchmark) at 3-6x lower CPU per-line latency and a
+    # much smaller checkpoint (~62M vs ~334M params) — a clear win with no
+    # measured accuracy cost for the "weak university servers, no GPU"
+    # target environment. See the final report for the full evidence table.
+    HANDWRITTEN_OCR_EN_MODEL: str = os.getenv(
+        "HANDWRITTEN_OCR_EN_MODEL", "microsoft/trocr-small-handwritten"
+    )
+    # No realistic lighter Arabic alternative was found (searched the HF
+    # Hub — this remains the only free/local Arabic handwriting checkpoint
+    # identified); kept as-is. Its real-handwriting accuracy is genuinely
+    # poor even after the line-segmentation aspect-ratio fix (see the final
+    # report's OCR Decision / Remaining Issues) — a known, now-quantified
+    # limitation, not something this task's scope (no huge VLM, no GPU
+    # assumption) can fully resolve.
+    HANDWRITTEN_OCR_AR_MODEL: str = os.getenv(
+        "HANDWRITTEN_OCR_AR_MODEL", "RayR1/trocr-base-arabic-handwritten"
+    )
+    # Upper bound on generated tokens per OCR call — TrOCR models target
+    # single text-line images, so this only needs to comfortably cover one
+    # line/short passage, not a full page.
+    HANDWRITTEN_OCR_MAX_NEW_TOKENS: int = _int("HANDWRITTEN_OCR_MAX_NEW_TOKENS", 256)
+    # Multi-line pages are batched through the model this many lines at a
+    # time (instead of one call per line) — see
+    # HandwrittenOCRService._recognize_lines / scripts/evaluate_ocr_followup.py
+    # for the benchmark this default is based on. Bounds peak RAM growth
+    # for a page with many lines (up to _LINE_MAX_COUNT=80) instead of
+    # batching the whole page in one call.
+    HANDWRITTEN_OCR_MAX_BATCH_SIZE: int = _int("HANDWRITTEN_OCR_MAX_BATCH_SIZE", 8)
 
     # ── Agent ────────────────────────────────────────────────────────────
     AGENT_MAX_ITERATIONS: int = _int("AGENT_MAX_ITERATIONS", 6)

@@ -21,6 +21,8 @@ _EXT_TO_TYPE = {
     "xlsx": "excel", "xls": "excel", "csv": "excel",
 }
 
+SUPPORTED_EXTENSIONS = frozenset(_EXT_TO_TYPE.keys())
+
 _DISPATCH: "dict[str, Callable[[str, bytes], List[Document]]]" = {
     "pdf": pdf_loader.load,
     "docx": docx_loader.load, "doc": docx_loader.load,

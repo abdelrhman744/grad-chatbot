@@ -100,7 +100,12 @@ async def chat_voice(
     try:
         audio_bytes = await audio.read()
         lang_hint = language if language in {"ar", "en"} else None
-        stt_text = transcribe_audio(audio_bytes, language=lang_hint)
+        # transcribe_audio() is synchronous, CPU/IO-heavy work (ffmpeg
+        # subprocess + Whisper decoding) — run it on a worker thread so it
+        # doesn't block the event loop for every other concurrent request,
+        # matching the asyncio.to_thread(_run_agent, ...) pattern already
+        # used below and in POST /chat.
+        stt_text = await asyncio.to_thread(transcribe_audio, audio_bytes, language=lang_hint)
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Audio transcription failed: {e}")
 

@@ -62,9 +62,13 @@ export interface ReportResponse {
  *    never reached FastAPI at all — a proxy/network failure upstream of
  *    the backend — in which case there is no `detail` field to read).
  */
-async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+async function apiFetch(
+  path: string,
+  init: RequestInit = {},
+  timeoutMs: number = REQUEST_TIMEOUT_MS
+): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   let res: Response;
   try {
@@ -72,7 +76,7 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<Response>
   } catch (err: any) {
     if (err?.name === "AbortError") {
       throw new Error(
-        `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s. The backend may be ` +
+        `Request timed out after ${timeoutMs / 1000}s. The backend may be ` +
           "unreachable or overloaded — check that the FastAPI server is running."
       );
     }
@@ -224,6 +228,41 @@ export async function getStoredFiles(): Promise<StoredFile[]> {
   const res = await apiFetch("/stored-files");
   const body = await res.json();
   return body.files ?? [];
+}
+
+// ── Handwritten OCR (local TrOCR, free — see backend/routes/ocr.py) ────────
+
+export type HandwrittenLanguage = "ar" | "en";
+
+export interface HandwrittenOcrResult {
+  text: string;
+  language: HandwrittenLanguage;
+  type: "handwritten";
+  indexed?: boolean;
+  chunks_added?: number;
+}
+
+// The very first request for a given language triggers a one-time model
+// download from Hugging Face on the backend (can take a couple of minutes
+// on a slow connection) — a much longer client-side timeout than the
+// default 60s is used so that cold start doesn't surface as a false
+// "request timed out" error. Warm requests return in a few seconds.
+const OCR_REQUEST_TIMEOUT_MS = 5 * 60_000;
+
+export async function ocrHandwritten(
+  file: File,
+  language: HandwrittenLanguage
+): Promise<HandwrittenOcrResult> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("language", language);
+
+  const res = await apiFetch(
+    "/ocr/handwritten",
+    { method: "POST", body: form },
+    OCR_REQUEST_TIMEOUT_MS
+  );
+  return res.json();
 }
 
 export async function generateReport(filename: string): Promise<ReportResponse> {

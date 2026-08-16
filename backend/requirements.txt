@@ -29,6 +29,18 @@ pillow
 docx2txt
 pypdf
 
+# Handwritten OCR (local, free — Hugging Face TrOCR, see
+# services/handwritten_ocr_service.py). `transformers` is already an
+# indirect dependency of sentence-transformers above; pinned explicitly
+# here since it's imported directly. `sentencepiece` is required by the
+# Arabic TrOCR checkpoint's tokenizer; `accelerate` speeds up model
+# loading/device placement; `huggingface_hub` is the client that performs
+# the automatic first-run model download.
+transformers
+sentencepiece
+accelerate
+huggingface_hub
+
 # Excel/CSV ingestion
 pandas>=2.0
 openpyxl>=3.1
