@@ -164,6 +164,7 @@ _LINE_MIN_INK_COL_FRAC = 0.015  # (within a band) a column counts as "text" once
 _LINE_VERTICAL_PAD_FRAC = 0.35  # extra padding above/below each detected band, as a fraction of the band's own height — covers ascenders/descenders/dots so characters aren't clipped
 _LINE_HORIZONTAL_PAD_PX = 14    # extra left/right padding in pixels — avoids clipping leading/trailing strokes or punctuation
 _LINE_MAX_COUNT = 80            # sanity cap: more "lines" than this on one page almost certainly means noisy segmentation, not real structure — fall back to whole image rather than run OCR 80+ times
+_LINE_MAX_ASPECT_RATIO = 10.0   # width:height ceiling for a single cropped line — see the widen-if-too-wide step in _segment_lines(); 10:1 matches this module's own documented "good" ratio (see HANDWRITTEN_OCR.md's crop-aspect-ratio finding)
 
 
 def _ink_mask(gray: np.ndarray) -> np.ndarray:
@@ -262,6 +263,30 @@ def _segment_lines(image: Image.Image) -> List[Image.Image]:
             continue
         cx0 = max(0, int(text_cols[0]) - _LINE_HORIZONTAL_PAD_PX)
         cx1 = min(w, int(text_cols[-1]) + 1 + _LINE_HORIZONTAL_PAD_PX)
+
+        # Bug fix (found via evaluate_ocr_preprocessing_check.py against
+        # real IAM/KHATT handwriting samples): tightly cropping to just the
+        # ink rows is exactly right for a photographed page's huge blank
+        # margins, but on an input that was ALREADY a fairly tight single
+        # line (e.g. a pre-cropped benchmark image, or a user-submitted
+        # close-up crop), the same tight vertical crop can make the
+        # resulting aspect ratio MORE extreme than the input — measured
+        # directly turning a ~10:1 input into a ~20:1 crop — pushing it
+        # further into the exact "very wide/thin crop gets squashed hard by
+        # TrOCR's fixed square resize" failure this module's own docs
+        # already warn about (see HANDWRITTEN_OCR.md). If the tight crop's
+        # aspect ratio exceeds _LINE_MAX_ASPECT_RATIO, widen the crop
+        # vertically (symmetrically, clamped to the image bounds) until it
+        # no longer does — this keeps the original page-margin-trimming
+        # benefit for genuinely wide page-width bands while no longer
+        # actively hurting already-tight single-line input.
+        crop_w = cx1 - cx0
+        crop_h = cy1 - cy0
+        if crop_h > 0 and crop_w / crop_h > _LINE_MAX_ASPECT_RATIO:
+            target_h = crop_w / _LINE_MAX_ASPECT_RATIO
+            extra = (target_h - crop_h) / 2
+            cy0 = max(0, int(cy0 - extra))
+            cy1 = min(h, int(cy1 + extra))
 
         lines.append(image.crop((cx0, cy0, cx1, cy1)))
 
@@ -378,7 +403,7 @@ class HandwrittenOCRService:
             lines = [image]
         t1 = time.time()
 
-        texts = [self._recognize_image(img, language) for img in lines]
+        texts = self._recognize_lines(lines, language)
         t2 = time.time()
 
         combined = "\n".join(t for t in (s.strip() for s in texts) if t)
@@ -388,6 +413,81 @@ class HandwrittenOCRService:
             "inference_time_s": t2 - t1,
         }
         return combined, debug
+
+    def _recognize_lines(self, images: List[Image.Image], language: str) -> List[str]:
+        """
+        Recognize a list of already-cropped line images. A single line
+        (by far the most common call shape — one pre-cropped image, or a
+        page that segmented into just one line) goes through
+        `_recognize_image` directly; more than one line is batched through
+        the model in RAM-bounded sub-batches of at most
+        HANDWRITTEN_OCR_MAX_BATCH_SIZE instead of one model call per line.
+
+        This used to be a plain `[self._recognize_image(img, language) for
+        img in lines]` loop — strictly sequential, one full forward pass
+        per line even for an 80-line page. Benchmarked before changing it
+        (see scripts/evaluate_ocr_followup.py): batching measured a
+        consistent ~15-54% latency reduction for English with IDENTICAL
+        CER (not a quality/speed tradeoff) across two independent page
+        sizes, and was latency-neutral (~same, occasionally a couple %
+        slower) for Arabic — never a regression worth avoiding batching
+        over. RSS increase was modest (tens of MB), bounded further here
+        by the sub-batch size cap rather than batching an entire page's
+        worth of lines (up to 80) in one call.
+
+        Falls back to sequential per-image recognition for any sub-batch
+        that raises (e.g. one malformed line image failing a batched
+        forward pass) so one bad line can't take down an entire page.
+        """
+        if len(images) <= 1:
+            return [self._recognize_image(img, language) for img in images]
+
+        max_batch = max(1, settings.HANDWRITTEN_OCR_MAX_BATCH_SIZE)
+        texts: List[str] = []
+        for i in range(0, len(images), max_batch):
+            batch = images[i:i + max_batch]
+            try:
+                texts.extend(self._recognize_batch(batch, language))
+            except Exception as e:
+                log.warning(
+                    f"Batched OCR inference failed for a {len(batch)}-image sub-batch "
+                    f"— falling back to sequential recognition for it: {e}"
+                )
+                texts.extend(self._recognize_image(img, language) for img in batch)
+        return texts
+
+    def _recognize_batch(self, images: List[Image.Image], language: str) -> List[str]:
+        """Run TrOCR on several already-cropped line images in ONE batched
+        forward pass. Raises OCRModelError on failure — the caller
+        (`_recognize_lines`) decides whether to fall back to per-image
+        recognition for this sub-batch."""
+        processor, model = self._get_model(language)  # type: ignore[arg-type]
+        device = self._resolve_device()
+
+        try:
+            import torch
+
+            eos_token_id = model.config.eos_token_id
+            if eos_token_id is None:
+                eos_token_id = model.generation_config.eos_token_id
+            pad_token_id = model.config.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = model.generation_config.pad_token_id
+
+            pixel_values = processor(images=images, return_tensors="pt").pixel_values.to(device)
+            with torch.inference_mode():
+                generated_ids = model.generate(
+                    pixel_values,
+                    max_new_tokens=settings.HANDWRITTEN_OCR_MAX_NEW_TOKENS,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=pad_token_id,
+                    use_cache=True,
+                )
+            decoded = processor.batch_decode(generated_ids, skip_special_tokens=True)
+        except Exception as e:
+            raise OCRModelError(f"Batched handwritten OCR inference failed: {e}") from e
+
+        return [t.strip() for t in decoded]
 
     def _recognize_image(self, image: Image.Image, language: str) -> str:
         """Run TrOCR on a single already-cropped PIL image (one line) and

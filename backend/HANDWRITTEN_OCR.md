@@ -44,8 +44,10 @@ own service and its own endpoint instead of being bolted onto Tesseract.
 
 | Language | Model | Loaded via |
 |---|---|---|
-| English | [`microsoft/trocr-base-handwritten`](https://huggingface.co/microsoft/trocr-base-handwritten) | `TrOCRProcessor` + `VisionEncoderDecoderModel` |
+| English | [`microsoft/trocr-small-handwritten`](https://huggingface.co/microsoft/trocr-small-handwritten) | `TrOCRProcessor` + `VisionEncoderDecoderModel` |
 | Arabic | [`RayR1/trocr-base-arabic-handwritten`](https://huggingface.co/RayR1/trocr-base-arabic-handwritten) | `TrOCRProcessor` + `VisionEncoderDecoderModel` |
+
+**English default changed from `trocr-base-handwritten` to `trocr-small-handwritten`** after a real-handwriting evaluation (`scripts/evaluate_handwritten_ocr.py`, IAM handwriting-line dataset): once the line-segmentation aspect-ratio bug below was fixed, both models scored statistically indistinguishable CER (0.253 small vs. 0.248 base over a 6-sample benchmark) but the small checkpoint ran 3-6x faster per line on CPU with a much smaller footprint (~62M vs ~334M params) — a clear win for the "weak university servers, no GPU" target environment with no measured accuracy cost. No lighter realistic Arabic alternative was found (see Limitations).
 
 Both are configurable via `HANDWRITTEN_OCR_EN_MODEL` / `HANDWRITTEN_OCR_AR_MODEL`
 in `backend/.env` (see `backend/.env.example`) if you ever want to swap in a
@@ -238,6 +240,22 @@ lines into one crop or split one line into two. This is a deliberate
 scope decision (see the feature's original design notes: "do not introduce
 a huge new computer-vision system unnecessarily") rather than an oversight.
 
+**Fixed bug (found via real-handwriting evaluation, not by inspection
+alone)**: the per-line vertical crop was tight enough that on an input
+that was ALREADY a fairly tight single line (a pre-cropped benchmark
+image, or a close-up user crop — not just a huge photographed page), the
+same tight crop could make the line's aspect ratio MORE extreme than the
+input (measured turning a ~10:1 crop into a ~20:1 one), pushing it further
+into exactly the "very wide/thin crop gets squashed" failure this
+document already warned about below. `_segment_lines()` now widens a
+crop's vertical bounds (symmetrically, clamped to the image) whenever its
+width:height ratio exceeds `_LINE_MAX_ASPECT_RATIO` (10:1, matching this
+doc's own "good" ratio finding) — this keeps the original benefit for
+genuinely wide page-width bands while no longer actively hurting
+already-tight input. Measured impact on the real IAM/KHATT evaluation
+samples: English CER 0.356 → 0.248, Arabic CER 0.844 → 0.762 — at zero
+latency/RAM cost.
+
 ## Pipeline integration (optional)
 
 Passing `conversation_id` **and** `index=true` feeds the extracted text into
@@ -295,6 +313,22 @@ docker compose logs backend
   in the backend's Python/torch environment (i.e. a CUDA-enabled torch
   build is installed and a GPU is visible) — no extra configuration.
 
+## Batched multi-line inference
+
+A page with more than one detected line is now recognized in RAM-bounded
+sub-batches (`HANDWRITTEN_OCR_MAX_BATCH_SIZE`, default 8 lines per model
+call) instead of one full model call per line. Benchmarked before
+adopting (`scripts/evaluate_ocr_followup.py`): batching measured a
+consistent 15-54% latency reduction for English with IDENTICAL output
+text (not a quality/speed tradeoff) across two independent page sizes,
+and was latency-neutral for Arabic (never a regression) — so it was
+adopted for both languages rather than special-cased. Any sub-batch that
+fails falls back to sequential per-image recognition for just that
+sub-batch, so one malformed line image can't fail an entire page. A
+single line (the majority of real calls — one pre-cropped image, or a
+page that segments into one line) skips batching entirely, since there's
+nothing to batch.
+
 ## Limitations (explicit, not glossed over)
 
 - Full pages are now handled automatically (see "Full-page documents"
@@ -327,3 +361,11 @@ docker compose logs backend
   [1 letter off from "chain"], "of", "Regid" [1 letter off from "Rigid"],
   "bodies"). **Recommendation: crop as tightly as practical around the
   text itself, not just a horizontal band across the full image width.**
+- **Arabic accuracy is genuinely poor on real handwriting**, now quantified
+  (`scripts/evaluate_handwritten_ocr.py` against real KHATT corpus
+  samples): average CER ≈0.76 even after the aspect-ratio fix above —
+  several real samples recognize as just "." or a few stray characters.
+  No realistic lighter or more accurate free/local alternative was found
+  on the Hugging Face Hub during this evaluation. This is a real,
+  high-severity limitation of the current Arabic checkpoint, not a
+  pipeline defect — flagged here rather than glossed over.

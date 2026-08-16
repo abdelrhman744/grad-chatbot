@@ -1,0 +1,6 @@
+# Dev/test-only dependencies — never installed in the production Docker
+# image (see Dockerfile, which only installs requirements.txt). Not
+# required to run the app; only to run backend/tests/ and
+# backend/scripts/evaluate_handwritten_ocr.py.
+pytest
+psutil

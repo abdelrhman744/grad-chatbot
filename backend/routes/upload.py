@@ -22,8 +22,16 @@ from fastapi.responses import StreamingResponse
 
 from config import settings
 from services import upload_jobs
-from services.rag_service import update_db_files, list_stored_files, get_stored_file_bytes
+from services.rag_service import (
+    delete_document,
+    find_registry_entry_by_document_id,
+    get_stored_file_bytes,
+    list_stored_files,
+    reindex_document,
+    update_db_files,
+)
 from services.storage_service import StorageUnavailableError
+from utils.file_validation import InvalidFileError, UnsupportedFileTypeError, validate_upload
 
 log = logging.getLogger("routes.upload")
 
@@ -97,8 +105,16 @@ async def upload_files(
                 ),
             )
 
+        filename = f.filename or "unknown"
+        try:
+            validate_upload(filename, data)
+        except UnsupportedFileTypeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except InvalidFileError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
         file_dicts.append({
-            "filename": f.filename or "unknown",
+            "filename": filename,
             "data": data,
         })
 
@@ -155,3 +171,110 @@ async def download_stored_file(object_name: str):
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{object_name}"'},
     )
+
+
+# ── Document lifecycle: re-index / delete (Tasks 3 & 4) ─────────────────────
+
+def _categorize_reindex_error(stage: str, exc: Exception) -> str:
+    if isinstance(exc, ValueError):
+        return str(exc)
+    if isinstance(exc, RuntimeError):
+        return str(exc)
+    if isinstance(exc, StorageUnavailableError):
+        return f"File storage is currently unavailable: {exc}"
+    return _categorize_error(stage, exc)
+
+
+def _reindex_job(job_id: str, document_id: str, conversation_id: str, new_file: Optional[dict]) -> None:
+    last_stage = "queued"
+
+    def _on_progress(stage: str) -> None:
+        nonlocal last_stage
+        last_stage = stage
+        upload_jobs.set_stage(job_id, stage)
+
+    try:
+        new_filename = new_file["filename"] if new_file else None
+        new_data = new_file["data"] if new_file else None
+        chunks_added = reindex_document(
+            document_id,
+            conversation_id,
+            new_filename=new_filename,
+            new_data=new_data,
+            on_progress=_on_progress,
+        )
+        upload_jobs.mark_done(job_id, chunks_added)
+    except Exception as e:
+        log.exception(f"Background re-index failed for job {job_id} (document_id={document_id!r})")
+        upload_jobs.mark_error(job_id, _categorize_reindex_error(last_stage, e))
+
+
+@router.post("/documents/{document_id}/reindex")
+async def reindex_document_route(
+    document_id: str,
+    conversation_id: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+):
+    """
+    Re-index an already-ingested document — either reprocessing its
+    original stored bytes (no `file`, e.g. after a chunking/embedding/OCR
+    fix or config change) or replacing its content (`file` given). Returns
+    a job id polled the same way as POST /upload (GET /upload/status/{job_id})
+    since re-indexing a large document goes through the same
+    parse -> chunk -> embed pipeline and shouldn't block the request.
+
+    Old vectors for this document_id are guaranteed removed before the
+    job reports success — see services.rag_service.reindex_document.
+    """
+    if find_registry_entry_by_document_id(document_id, conversation_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No document found with id '{document_id}' for this conversation.",
+        )
+
+    new_file: Optional[dict] = None
+    if file is not None:
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail=f"File '{file.filename}' is empty.")
+        max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        if len(data) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File '{file.filename}' is {len(data) / (1024 * 1024):.1f}MB, which exceeds "
+                    f"the {settings.MAX_UPLOAD_SIZE_MB}MB upload limit."
+                ),
+            )
+        new_filename = file.filename or "unknown"
+        try:
+            validate_upload(new_filename, data)
+        except UnsupportedFileTypeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except InvalidFileError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        new_file = {"filename": new_filename, "data": data}
+
+    job_id = upload_jobs.create_job([new_file["filename"]] if new_file else [])
+
+    asyncio.create_task(
+        asyncio.to_thread(_reindex_job, job_id, document_id, conversation_id, new_file)
+    )
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@router.delete("/documents/{document_id}")
+async def delete_document_route(document_id: str, conversation_id: str):
+    """
+    Delete a document and every one of its indexed chunks from Qdrant.
+    Idempotent — deleting an already-deleted (or never-existing)
+    document_id returns chunks_removed=0 rather than an error.
+    """
+    try:
+        removed = await asyncio.to_thread(delete_document, document_id, conversation_id)
+    except Exception as e:
+        log.exception(f"Failed to delete document_id={document_id!r}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
+
+    return {"document_id": document_id, "chunks_removed": removed}
