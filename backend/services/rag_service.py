@@ -462,11 +462,24 @@ def _query_variants(question: str, lang: str) -> List[str]:
     # language are fully independent LLM calls — run concurrently.
     max_alts = 3 if settings.QUERY_EXPANSION_ENABLED else 1
     target_lang = "ar" if detected == "en" else "en"
+
+    # Each lambda is ALSO individually timed (query_rewrite_ms /
+    # translate_ms) in addition to the existing combined
+    # query_rewrite_and_translate substage — the two calls run
+    # concurrently on different threads but write to DIFFERENT substage
+    # names, so there is no read-modify-write race on the same dict key
+    # (see RequestTimer.record_substage). Pure instrumentation: same two
+    # calls, same arguments, same concurrency pattern as before.
+    def _timed_rewrite():
+        with timing.substage("query_rewrite_ms"):
+            return _rewrite_query(q, detected, max_alts)
+
+    def _timed_translate():
+        with timing.substage("translate_ms"):
+            return _translate(q, target_lang)
+
     with timing.substage("query_rewrite_and_translate"):
-        (fixed, alternatives), translated = _run_concurrent([
-            lambda: _rewrite_query(q, detected, max_alts),
-            lambda: _translate(q, target_lang),
-        ])
+        (fixed, alternatives), translated = _run_concurrent([_timed_rewrite, _timed_translate])
 
     for alt in alternatives:
         add(alt)
@@ -691,6 +704,48 @@ def _rerank(
     return ranked, debugs
 
 
+def _add_raw_question_anchor(
+    variants: List[str], planner_question: str, raw_question: Optional[str]
+) -> List[str]:
+    """
+    Deterministically add the user's own literal wording (+ cheap LOCAL
+    normalization — no LLM calls) to the retrieval variant set, alongside
+    whatever `planner_question` (which may be an LLM-generated
+    reformulation) already produced via `_query_variants`.
+
+    Why: the ReAct planner is free to reformulate the retrieve query text
+    (needed for legitimate coreference resolution — see prompt.py), but a
+    hosted LLM's exact wording for "the same" request is not guaranteed to
+    be stable run-to-run even at temperature 0 (documented already in
+    Agent._correct_premature_terminal's docstring for tool CHOICE; the same
+    non-determinism applies to the free-text query it writes). Since
+    `_rewrite_query`/`_translate` are cached by exact query string, a
+    different planner phrasing is a full cache miss that can pull in a
+    different candidate pool for what the user experiences as "the exact
+    same question". Anchoring on the raw literal text — which never comes
+    from an LLM and is therefore always stable — closes that gap without
+    adding any new LLM calls, extra thresholds, or reranking/MMR changes.
+
+    No-op (returns `variants` unchanged) when `raw_question` is empty or
+    already identical to `planner_question` — the common case for a
+    direct, non-paraphrased question, where nothing needs anchoring.
+    """
+    raw_question = _clean(raw_question)
+    if not raw_question or raw_question.lower() == _clean(planner_question).lower():
+        return variants
+
+    raw_lang = detect_language(raw_question)
+    extra = [raw_question, _normalize(raw_question)]
+    extra.append(_normalize_arabic(raw_question) if raw_lang == "ar" else raw_question.lower())
+
+    out = list(variants)
+    for v in extra:
+        v = _clean(v)
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
 def _retrieve(
     question: str,
     lang: str,
@@ -698,6 +753,7 @@ def _retrieve(
     k: Optional[int] = None,
     top_n: Optional[int] = None,
     source_filter: Optional[str] = None,
+    raw_question: Optional[str] = None,
 ) -> Tuple[List[Document], str, List[dict]]:
     """
     Retrieve + rerank documents for a question.
@@ -715,7 +771,7 @@ def _retrieve(
     implementation. There is no "search everything" mode anymore: every
     caller must know which conversation it's retrieving for. Used
     internally by `ask_question` and exposed via `retrieve()` for the
-    agent's retrieve tool.
+    agent's retrieve tool. `raw_question` — see `_add_raw_question_anchor`.
 
     Returns (ranked_docs, debug_str, per_doc_debug) — `per_doc_debug` is
     the same length/order as `ranked_docs` and carries each doc's
@@ -730,6 +786,7 @@ def _retrieve(
 
     with timing.stage("query_variant_generation_total"):
         variants = _query_variants(question, lang)
+        variants = _add_raw_question_anchor(variants, question, raw_question)
 
     # _query_variants already dedupes exact-string repeats, but e.g. "Query"
     # and a later ".lower()" variant "query" can both survive as distinct
@@ -785,14 +842,26 @@ def _retrieve(
         # concurrently-submitted work rather than truly parallelizing it
         # (measured ~10x slower — see PROFILING.md). This is the expensive
         # step, done once, up front.
-        vectors = embeddings.embed_queries(variants)
+        #
+        # embedding_ms / qdrant_search_ms below are ADDITIONAL, finer-
+        # grained substages nested inside the existing
+        # embedding_and_qdrant_retrieval stage (unchanged) — each
+        # substage() call here is made once by THIS single calling thread
+        # (embedding is one batched call; the Qdrant fan-out is measured
+        # as one wall-clock block around the whole _run_concurrent call,
+        # not per-worker-thread), so this adds no new concurrent-write
+        # risk. Pure instrumentation: same calls, same arguments, same
+        # batching/concurrency as before.
+        with timing.substage("embedding_ms"):
+            vectors = embeddings.embed_queries(variants)
 
         # Only the Qdrant lookups (cheap, I/O-bound) are fanned out across
         # threads now — no embedding work left inside them to contend over.
-        for docs in _run_concurrent(
-            [lambda q=q, v=v: _search_by_vector(q, v) for q, v in zip(variants, vectors)]
-        ):
-            all_docs.extend(docs)
+        with timing.substage("qdrant_search_ms"):
+            for docs in _run_concurrent(
+                [lambda q=q, v=v: _search_by_vector(q, v) for q, v in zip(variants, vectors)]
+            ):
+                all_docs.extend(docs)
 
     # Fallback for very typo-heavy or short queries
     if not all_docs:
@@ -1940,6 +2009,7 @@ def retrieve(
     lang: str = "auto",
     top_k: int = 5,
     source_filter: Optional[str] = None,
+    raw_question: Optional[str] = None,
 ) -> List[dict]:
     """
     Retrieve relevant chunks for a question, restricted to `conversation_id`'s
@@ -1949,6 +2019,11 @@ def retrieve(
     by topic-scoped report generation (services.report_service) with a
     larger top_k and, optionally, `source_filter` to search within one
     named document instead of that conversation's whole knowledge base.
+
+    `raw_question`, if given, is the ORIGINAL user message this retrieval
+    is answering (as opposed to `question`, which may be an LLM-planner
+    reformulation of it) — see `_retrieve`'s docstring for why this is
+    added as a deterministic extra variant.
 
     Returns a list of dicts: {"id", "text", "metadata": {...}}
     """
@@ -1960,6 +2035,7 @@ def retrieve(
         question, detected_lang, conversation_id,
         k=max(top_k, settings.RETRIEVER_K), top_n=top_k,
         source_filter=source_filter,
+        raw_question=raw_question,
     )
     log.debug(f"[agent] Retrieval for '{question}' (conversation_id={conversation_id!r}):\n{debug}")
 

@@ -210,12 +210,12 @@ class Agent:
                     })
                     continue
 
-                context = self._run_tool(action, context)
+                context = self._run_tool(action, context, question)
                 context.retrieved_questions.append(action.arguments.question)
                 self._update_active_document_from_retrieval(context)
                 continue
 
-            context = self._run_tool(action, context)
+            context = self._run_tool(action, context, question)
 
             if action.action in TERMINAL_TOOLS:
                 break
@@ -251,14 +251,16 @@ class Agent:
             yield from self._run_stream_impl(question, language=language)
 
     def _run_stream_impl(self, question: str, language: str = "auto"):
-        detected_lang = detect_language(question) if language == "auto" else language
+        with timing.stage("language_detection"):
+            detected_lang = detect_language(question) if language == "auto" else language
         context = ExecutionContext(language=detected_lang)
         full_text = ""
 
         for iteration in range(self.max_iterations):
             messages = self._build_messages(question, context)
-            action = self.llm.invoke(messages, fallback_question=question)
-            action = self._correct_premature_terminal(messages, action, context, question)
+            with timing.stage("agent_planning"):
+                action = self.llm.invoke(messages, fallback_question=question)
+                action = self._correct_premature_terminal(messages, action, context, question)
 
             if settings.AGENT_DEBUG:
                 self._debug_step(iteration + 1, action)
@@ -275,7 +277,7 @@ class Agent:
                     })
                     continue
 
-                context = self._run_tool(action, context)
+                context = self._run_tool(action, context, question)
                 context.retrieved_questions.append(action.arguments.question)
                 self._update_active_document_from_retrieval(context)
                 continue
@@ -295,26 +297,34 @@ class Agent:
                             else "Generating the report — this may take a moment..."
                         ),
                     }
-                    context = self._run_tool(action, context)
+                    context = self._run_tool(action, context, question)
                     full_text = context.answer or ""
                 else:
-                    for piece in self._stream_terminal_action(action, context):
-                        full_text += piece
-                        yield {"type": "token", "text": piece}
+                    # Wraps the full token-by-token generation, same stage
+                    # name/semantics as generate_answer()'s
+                    # timing.stage("llm_generation") on the non-streaming
+                    # path (rag_service.py) — measures end-to-end LLM
+                    # completion time here since there is no single
+                    # invoke() call to wrap around a streaming generator.
+                    with timing.stage("llm_generation"):
+                        for piece in self._stream_terminal_action(action, context):
+                            full_text += piece
+                            yield {"type": "token", "text": piece}
                     self._finalize_stream(action, context, full_text)
                 break
 
-            context = self._run_tool(action, context)
+            context = self._run_tool(action, context, question)
         else:
             # Exhausted max_iterations — force a streamed final answer from
             # whatever context we have so the user always gets a response.
             log.warning(f"Agent hit max_iterations ({self.max_iterations}) without finishing.")
             memory_text = self.memory_manager.as_prompt_text()
-            for piece in rag_service.generate_answer_stream(
-                question, context.documents, lang=context.language, memory=memory_text
-            ):
-                full_text += piece
-                yield {"type": "token", "text": piece}
+            with timing.stage("llm_generation"):
+                for piece in rag_service.generate_answer_stream(
+                    question, context.documents, lang=context.language, memory=memory_text
+                ):
+                    full_text += piece
+                    yield {"type": "token", "text": piece}
             context.answer = full_text.strip()
 
         self._remember(question, context)
@@ -405,9 +415,27 @@ class Agent:
             return "(none)"
         return "\n".join(json.dumps(o, ensure_ascii=False) for o in observations)
 
-    def _run_tool(self, action, context: ExecutionContext) -> ExecutionContext:
+    def _run_tool(self, action, context: ExecutionContext, raw_question: str = "") -> ExecutionContext:
         tool = self.tools[action.action.value]
-        return tool.run(context=context, **action.arguments.model_dump())
+        kwargs = action.arguments.model_dump()
+        if action.action == ToolName.RETRIEVE and not context.retrieved_questions:
+            # Anchor only the FIRST retrieve of a turn to the user's own
+            # literal wording, in addition to whatever the planner LLM
+            # chose to search for. The planner is free (and needs to be
+            # free) to reformulate the retrieve query for coreference
+            # resolution on LATER retrieves this turn (see prompt.py's
+            # Reference & Coreference Resolution section), but that
+            # reformulation is not guaranteed to be stable run-to-run for a
+            # hosted LLM even at temperature 0 (see
+            # _correct_premature_terminal's docstring) — confirmed directly:
+            # the exact same first-retrieve user question can make the
+            # planner emit different search text on different runs, which
+            # changes the retrieval candidate pool even though the
+            # underlying retrieval pipeline itself is fully deterministic
+            # for a fixed query string. See rag_service._retrieve's
+            # `raw_question` parameter — this adds zero extra LLM calls.
+            kwargs["raw_question"] = raw_question
+        return tool.run(context=context, **kwargs)
 
     def _correct_premature_terminal(self, messages: list[dict], action, context: ExecutionContext, question: str):
         """

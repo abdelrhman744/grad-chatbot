@@ -215,6 +215,23 @@ class Settings:
     SILENCE_THRESHOLD_DB: float = _float("SILENCE_THRESHOLD_DB", -60.0)
     FFMPEG_PATH: str = os.getenv("FFMPEG_PATH", "ffmpeg")
     TESSERACT_CMD: str = os.getenv("TESSERACT_CMD", "tesseract")
+    # Bounded page-level parallelism for Tesseract OCR (services/ocr_service.py).
+    # Each concurrent page spawns its own Tesseract subprocess, so this
+    # directly caps how many Tesseract processes can run at once — keep it
+    # modest on shared/weak servers regardless of page count or CPU count.
+    OCR_MAX_CONCURRENT_PAGES: int = _int("OCR_MAX_CONCURRENT_PAGES", 4)
+    # A page/image's first (cheapest) OCR attempt is accepted as-is once its
+    # extracted text clears this length — only then does the full
+    # preprocessing-strategy x PSM-mode sweep run (see
+    # ocr_service._ocr_image_tiered). Same value PyPDFLoader's own
+    # whole-document text-length check already used (unchanged threshold,
+    # now also reused per-page — see loaders/pdf_loader.py).
+    OCR_MIN_TEXT_CHARS: int = _int("OCR_MIN_TEXT_CHARS", 20)
+    # Minimum fraction of non-whitespace characters that must be
+    # alphanumeric (Arabic or Latin letters, digits) for a first-attempt
+    # OCR result to be trusted without escalating to the full sweep — cheap
+    # guard against accepting sparse/garbled noise from a single pass.
+    OCR_MIN_ALNUM_RATIO: float = _float("OCR_MIN_ALNUM_RATIO", 0.6)
 
     # ── Handwritten OCR (TrOCR, local via Hugging Face `transformers`) ────
     # Free/local/offline-capable handwriting recognition — separate from the
