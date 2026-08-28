@@ -14,6 +14,7 @@ import json
 import logging
 from typing import List
 
+from groq import BadRequestError
 from pydantic import TypeAdapter, ValidationError
 
 from config import settings
@@ -36,14 +37,22 @@ class AgentLLM:
         self._llm = get_agent_llm(model=self.model_name)
         self._adapter = TypeAdapter(AgentAction)
         self.max_retries = max_retries
+        # See config.py's AGENT_FALLBACK_MODEL docstring: used only for
+        # Groq's own 400 json_validate_failed/json_generate_failed
+        # (confirmed to happen occasionally even with the primary model at
+        # temperature 0 — hosted inference is not perfectly deterministic).
+        # Built lazily (not in __init__) since most turns never need it.
+        self._fallback_llm = None
 
     def invoke(self, messages: List[dict], fallback_question: str = "") -> AgentAction:
         current_messages = list(messages)
 
         last_error: Exception | None = None
+        used_fallback_model = False
         for attempt in range(self.max_retries + 1):
             try:
-                raw = self._llm.chat(current_messages, json_mode=True)
+                llm = self._fallback_llm if used_fallback_model else self._llm
+                raw = llm.chat(current_messages, json_mode=True)
                 data = json.loads(raw)
                 return self._adapter.validate_python(data)
             except (json.JSONDecodeError, ValidationError) as e:
@@ -59,12 +68,46 @@ class AgentLLM:
                         ),
                     }
                 ]
-            except Exception as e:
+            except BadRequestError as e:
+                # Groq's OWN server-side JSON-mode validator rejected the
+                # request outright — there is no model output to hand back
+                # for self-correction (unlike the branch above), and unlike
+                # a 429/network/auth failure (still re-raised unchanged
+                # below) this is specific to this one generation attempt,
+                # not a systemic account/infra problem — retrying the exact
+                # same prompt against a DIFFERENT model is safe here, not
+                # error-masking. One retry only; if the fallback model also
+                # fails this way, that's treated the same as any other
+                # malformed-output attempt (counts toward max_retries, then
+                # falls through to the deterministic heuristic below).
                 last_error = e
-                log.error(f"Agent LLM invocation error: {e}")
-                break
+                if not used_fallback_model and self.model_name != settings.AGENT_FALLBACK_MODEL:
+                    log.warning(
+                        f"Agent LLM ({self.model_name}) rejected by Groq's JSON validator "
+                        f"(attempt {attempt + 1}): {e} — retrying once against fallback "
+                        f"model {settings.AGENT_FALLBACK_MODEL!r}."
+                    )
+                    if self._fallback_llm is None:
+                        self._fallback_llm = get_agent_llm(model=settings.AGENT_FALLBACK_MODEL)
+                    used_fallback_model = True
+                else:
+                    log.warning(f"Agent LLM JSON validation rejected (attempt {attempt + 1}): {e}")
+            except Exception as e:
+                # A real API/transport failure (rate limit, network, auth,
+                # timeout, ...) is not something the heuristic fallback
+                # below can meaningfully paper over: asking the model to
+                # "return valid JSON" (the retry above) doesn't apply here,
+                # and silently degrading to a fabricated "retrieve" action
+                # previously produced a confusing, ungrounded final answer
+                # with no sources -- while masking the real cause (e.g. a
+                # Groq 429) from the user entirely. Let it propagate instead:
+                # routes/chat.py and routes/ws.py already turn an uncaught
+                # exception here into a clear, real-message error
+                # response/event rather than a fake successful answer.
+                log.error(f"Agent LLM invocation error (not swallowed — re-raising): {e}")
+                raise
 
-        log.warning(f"Falling back to heuristic action after planner failure: {last_error}")
+        log.warning(f"Falling back to heuristic action after {self.max_retries + 1} malformed-JSON attempts: {last_error}")
         return self._fallback_action(fallback_question)
 
     # ── Internal ─────────────────────────────────────────────────────────

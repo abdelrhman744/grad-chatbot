@@ -31,7 +31,15 @@ from utils import timing
 from .llm import AgentLLM
 from .prompt import SYSTEM_PROMPT, USER_PROMPT
 from .registry import build_tools
-from .schemas import ExecutionContext, RetrieveAction, RetrieveArguments, ToolName, TERMINAL_TOOLS
+from .schemas import (
+    ExecutionContext,
+    GenerateAction,
+    GenerateArguments,
+    RetrieveAction,
+    RetrieveArguments,
+    ToolName,
+    TERMINAL_TOOLS,
+)
 
 log = logging.getLogger("agent")
 
@@ -468,10 +476,46 @@ class Agent:
         than the old re-ask, which could (and per its own docstring,
         occasionally did) still return "respond" a second time.
 
-        Only fires once per turn, only when nothing has been retrieved yet.
+        Only the "nothing retrieved yet" branch below is limited to firing
+        once per turn (before any retrieval has happened). A SECOND,
+        independent backstop runs first, on EVERY iteration: the planner
+        can also discard already-retrieved evidence on a LATER step —
+        after a prior "retrieve" this turn genuinely found relevant
+        chunks, it can still (nondeterministically) choose "respond"
+        (memory-only) instead of "generate" on the next step, throwing
+        that evidence away. Confirmed via direct testing: retrieval
+        succeeded (real chunk, cross-encoder score 0.28) yet the planner
+        still answered "could you please rephrase your question?" from
+        memory alone, with empty sources. The "nothing retrieved yet"
+        check below never catches this — it returns the action as-is the
+        moment context.documents is non-empty, which is exactly the state
+        this second case needs corrected, not skipped.
         """
         if action.action not in (ToolName.RESPOND, ToolName.GENERATE):
             return action
+
+        if action.action == ToolName.RESPOND and context.documents:
+            # Deterministic, zero extra Groq calls (same technique as the
+            # retrieve-forcing branch below) — and always safe: generate_
+            # answer() already handles "documents present but don't
+            # actually answer this" correctly (it reports "not available"
+            # rather than hallucinating from memory — see the prompt's own
+            # HARD RULE this mirrors), so forcing "generate" here can only
+            # ever improve on discarding the retrieved evidence entirely.
+            log.warning(
+                f"Agent chose 'respond' with {len(context.documents)} document(s) already "
+                f"retrieved this turn for question={question!r} — deterministically forcing "
+                "'generate' so the retrieved evidence isn't discarded (no extra Groq call)."
+            )
+            return GenerateAction(
+                thought=(
+                    "Deterministic override: previous action discarded already-retrieved "
+                    "documents by choosing 'respond' instead of 'generate'."
+                ),
+                action=ToolName.GENERATE,
+                arguments=GenerateArguments(question=question[:500]),
+            )
+
         if context.retrieved_questions or context.documents:
             return action
 

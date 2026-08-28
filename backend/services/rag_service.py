@@ -49,6 +49,7 @@ from services.embeddings_provider import get_embeddings
 from services.llm_provider import GroqLLM, get_llm as _get_shared_llm
 from services import storage_service
 from utils import timing
+from utils.prompt_safety import wrap_untrusted_context
 
 log = logging.getLogger("rag_service")
 
@@ -940,6 +941,13 @@ def _retrieve(
 # ── Prompt & cleanup ────────────────────────────────────────────────────────────
 
 def build_prompt(context: str, question: str, lang: str) -> str:
+    # Retrieved chunk text originates from user-uploaded documents, not
+    # from the developer or the system — wrap it with explicit
+    # untrusted-data framing so an injected instruction inside a document
+    # ("ignore previous instructions...") is treated as content to report
+    # on, never as something to obey. See utils/prompt_safety.py.
+    context = wrap_untrusted_context(context, lang)
+
     if lang == "ar":
         return f"""أنت نظام استخراج معلومات متقدم. مهمتك: استخرج إجابة كاملة ومفصّلة من السياق المقدم فقط.
 
@@ -2102,13 +2110,17 @@ def generate_answer(question: str, documents: List[dict], lang: str = "auto", me
 
     prompt = build_prompt_with_memory(context, question, detected_lang, memory)
 
-    try:
-        with timing.stage("llm_generation"):
-            answer = str(llm.invoke(prompt))
-        return _clean_answer(answer, detected_lang)
-    except Exception as e:
-        log.error(f"[agent] generate_answer error: {e}")
-        return f"Error generating answer: {e}"
+    # A Groq/network failure here previously came back as a normal-looking
+    # `answer` string ("Error generating answer: ..."), which routes/chat.py
+    # would then return as a 200 OK chat response and Agent._remember would
+    # persist into long-term memory as if it were a real assistant turn.
+    # Let it propagate instead — routes/chat.py and routes/ws.py already
+    # turn an uncaught exception into a proper error response/event, and it
+    # never pollutes conversation memory. See the agent/llm.py fix for the
+    # same reasoning applied to the planner's LLM call.
+    with timing.stage("llm_generation"):
+        answer = str(llm.invoke(prompt))
+    return _clean_answer(answer, detected_lang)
 
 
 def generate_answer_stream(question: str, documents: List[dict], lang: str = "auto", memory: str = ""):
@@ -2134,12 +2146,12 @@ def generate_answer_stream(question: str, documents: List[dict], lang: str = "au
 
     prompt = build_prompt_with_memory(context, question, detected_lang, memory)
 
-    try:
-        for chunk in llm.stream(prompt):
-            yield chunk
-    except Exception as e:
-        log.error(f"[agent] generate_answer_stream error: {e}")
-        yield f"Error generating answer: {e}"
+    # See generate_answer's comment above — a mid-stream API/network
+    # failure should propagate (routes/ws.py's _produce() already turns an
+    # uncaught exception from agent.run_stream() into a proper {"type":
+    # "error"} event) rather than being yielded as if it were real answer
+    # text the user would see appended to whatever streamed so far.
+    yield from llm.stream(prompt)
 
 
 def _memory_only_prompt(question: str, memory: str, lang: str) -> str:
@@ -2189,12 +2201,7 @@ def answer_from_memory_stream(question: str, memory: str, lang: str = "auto"):
     detected_lang = detect_language(question) if lang == "auto" else lang
     prompt = _memory_only_prompt(question, memory, detected_lang)
 
-    try:
-        for chunk in llm.stream(prompt):
-            yield chunk
-    except Exception as e:
-        log.error(f"[agent] answer_from_memory_stream error: {e}")
-        yield f"Error generating answer: {e}"
+    yield from llm.stream(prompt)
 
 
 def summarize_stream(documents: List[dict], lang: str = "en"):
@@ -2204,21 +2211,16 @@ def summarize_stream(documents: List[dict], lang: str = "en"):
         return
 
     budgeted = _trim_to_budget([(d["text"], d) for d in documents], settings.MAX_CONTEXT_CHARS)
-    document_text = "\n\n".join(
+    document_text = wrap_untrusted_context("\n\n".join(
         f"{_chunk_label(d['metadata'], i+1)}\n{d['text']}" for i, d in enumerate(budgeted)
-    )
+    ), lang)
     prompt = (
         f"لخّص المستندات التالية بإيجاز ووضوح، بالاعتماد فقط على ما ورد فيها حرفيًا، دون إضافة أي معلومة من خارجها. كن مباشرًا؛ لا تضف مثالًا إلا إذا كان يوضّح نقطة غير بديهية:\n\n{document_text}"
         if lang == "ar"
         else f"Summarize the following documents clearly and concisely, using only what is stated in them — do not add any information from outside them. Be direct; only include an example if it clarifies a non-obvious point:\n\n{document_text}"
     )
 
-    try:
-        for chunk in llm.stream(prompt):
-            yield chunk
-    except Exception as e:
-        log.error(f"[agent] summarize_stream error: {e}")
-        yield f"Error generating summary: {e}"
+    yield from llm.stream(prompt)
 
 
 def compare_stream(question: str, documents: List[dict], lang: str = "en"):
@@ -2228,21 +2230,16 @@ def compare_stream(question: str, documents: List[dict], lang: str = "en"):
         return
 
     budgeted = _trim_to_budget([(d["text"], d) for d in documents], settings.MAX_CONTEXT_CHARS)
-    document_text = "\n\n".join(
+    document_text = wrap_untrusted_context("\n\n".join(
         f"{_chunk_label(d['metadata'], i+1)}\n{d['text']}" for i, d in enumerate(budgeted)
-    )
+    ), lang)
     prompt = (
         f"باستخدام المستندات التالية حصريًا (لا تستخدم أي معرفة خارجية)، أجب عن طلب المقارنة بشكل مباشر ومنظم. إذا كانت المستندات لا تحتوي على معلومات كافية للمقارنة المطلوبة، قل ذلك صراحة:\n\nالسؤال:\n{question}\n\nالمستندات:\n\n{document_text}"
         if lang == "ar"
         else f"Using only the following documents (no outside knowledge), answer this comparison request directly and in a well-organized way. If the documents do not contain enough information for the requested comparison, say so explicitly:\n\nQuestion:\n{question}\n\nDocuments:\n\n{document_text}"
     )
 
-    try:
-        for chunk in llm.stream(prompt):
-            yield chunk
-    except Exception as e:
-        log.error(f"[agent] compare_stream error: {e}")
-        yield f"Error generating comparison: {e}"
+    yield from llm.stream(prompt)
 
 
 def answer_from_memory(question: str, memory: str, lang: str = "auto") -> str:
@@ -2255,12 +2252,10 @@ def answer_from_memory(question: str, memory: str, lang: str = "auto") -> str:
     detected_lang = detect_language(question) if lang == "auto" else lang
     prompt = _memory_only_prompt(question, memory, detected_lang)
 
-    try:
-        answer = str(llm.invoke(prompt))
-        return _clean_answer(answer, detected_lang)
-    except Exception as e:
-        log.error(f"[agent] answer_from_memory error: {e}")
-        return f"Error generating answer: {e}"
+    # See generate_answer's comment above — let a real API/network failure
+    # propagate rather than returning it as if it were a normal answer.
+    answer = str(llm.invoke(prompt))
+    return _clean_answer(answer, detected_lang)
 
 
 def summarize(documents: List[dict], lang: str = "en") -> str:
@@ -2269,20 +2264,16 @@ def summarize(documents: List[dict], lang: str = "en") -> str:
         return "لا توجد مستندات لتلخيصها." if lang == "ar" else "No documents found to summarize."
 
     budgeted = _trim_to_budget([(d["text"], d) for d in documents], settings.MAX_CONTEXT_CHARS)
-    document_text = "\n\n".join(
+    document_text = wrap_untrusted_context("\n\n".join(
         f"{_chunk_label(d['metadata'], i+1)}\n{d['text']}" for i, d in enumerate(budgeted)
-    )
+    ), lang)
 
     if lang == "ar":
         prompt = f"لخّص المستندات التالية بإيجاز ووضوح، بالاعتماد فقط على ما ورد فيها حرفيًا، دون إضافة أي معلومة من خارجها. كن مباشرًا؛ لا تضف مثالًا إلا إذا كان يوضّح نقطة غير بديهية:\n\n{document_text}"
     else:
         prompt = f"Summarize the following documents clearly and concisely, using only what is stated in them — do not add any information from outside them. Be direct; only include an example if it clarifies a non-obvious point:\n\n{document_text}"
 
-    try:
-        return _clean(str(llm.invoke(prompt)))
-    except Exception as e:
-        log.error(f"[agent] summarize error: {e}")
-        return f"Error generating summary: {e}"
+    return _clean(str(llm.invoke(prompt)))
 
 
 def compare(question: str, documents: List[dict], lang: str = "en") -> str:
@@ -2291,20 +2282,16 @@ def compare(question: str, documents: List[dict], lang: str = "en") -> str:
         return "لا توجد مستندات كافية للمقارنة." if lang == "ar" else "No documents found to compare."
 
     budgeted = _trim_to_budget([(d["text"], d) for d in documents], settings.MAX_CONTEXT_CHARS)
-    document_text = "\n\n".join(
+    document_text = wrap_untrusted_context("\n\n".join(
         f"{_chunk_label(d['metadata'], i+1)}\n{d['text']}" for i, d in enumerate(budgeted)
-    )
+    ), lang)
 
     if lang == "ar":
         prompt = f"باستخدام المستندات التالية حصريًا (لا تستخدم أي معرفة خارجية)، أجب عن طلب المقارنة بشكل مباشر ومنظم. إذا كانت المستندات لا تحتوي على معلومات كافية للمقارنة المطلوبة، قل ذلك صراحة:\n\nالسؤال:\n{question}\n\nالمستندات:\n\n{document_text}"
     else:
         prompt = f"Using only the following documents (no outside knowledge), answer this comparison request directly and in a well-organized way. If the documents do not contain enough information for the requested comparison, say so explicitly:\n\nQuestion:\n{question}\n\nDocuments:\n\n{document_text}"
 
-    try:
-        return _clean(str(llm.invoke(prompt)))
-    except Exception as e:
-        log.error(f"[agent] compare error: {e}")
-        return f"Error generating comparison: {e}"
+    return _clean(str(llm.invoke(prompt)))
 
 
 def build_sources_from_dicts(documents: List[dict], lang: str = "en") -> str:

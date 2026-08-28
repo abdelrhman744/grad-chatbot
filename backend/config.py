@@ -13,6 +13,8 @@ default.
 from __future__ import annotations
 
 import os
+import secrets
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -45,7 +47,34 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _secret_key() -> str:
+    val = os.getenv("APP_SECRET_KEY", "").strip()
+    if val:
+        return val
+    generated = secrets.token_hex(32)
+    print(
+        "WARNING: APP_SECRET_KEY is not set - generated a random key for this "
+        "process only. Every conversation token signed with it stops verifying "
+        "the moment this process restarts, which means every currently open "
+        "conversation becomes inaccessible (its documents/memory are NOT "
+        "deleted, just no longer reachable with the old token). Set "
+        "APP_SECRET_KEY to a fixed, persistent value in your .env for anything "
+        "beyond throwaway local testing.",
+        file=sys.stderr,
+    )
+    return generated
+
+
 class Settings:
+    # ── Security ─────────────────────────────────────────────────────────
+    # Signs conversation_id tokens (see utils/conversation_auth.py) so a
+    # bare, guessed/leaked conversation_id string is no longer enough to
+    # read/modify/delete someone else's documents or memory — every
+    # request must also present a signature that only this key can
+    # produce. See _secret_key()'s warning above for what happens if this
+    # is left unset.
+    APP_SECRET_KEY: str = _secret_key()
+
     # ── CORS ─────────────────────────────────────────────────────────────
     # Comma-separated allowlist of origins permitted to call the API with
     # credentials. Wildcard ("*") is intentionally not supported here: it
@@ -65,9 +94,39 @@ class Settings:
     # GROQ_MODEL) if routing quality needs the larger model instead.
     AGENT_MODEL: str = os.getenv("AGENT_MODEL", "llama-3.1-8b-instant")
 
+    # Every JSON-mode model occasionally has Groq's own server-side JSON
+    # validator reject a request outright (400 json_validate_failed /
+    # json_generate_failed) -- confirmed happening for AGENT_MODEL itself
+    # during live testing (see agent/llm.py). Unlike a malformed-but-present
+    # response, there is no output to ask the model to self-correct, and
+    # unlike a 429/network/auth failure this is specific to one particular
+    # generation attempt -- retrying the identical prompt against a
+    # DIFFERENT model is the one case where papering over the failure is
+    # safe rather than masking a real problem. Deliberately a distinct
+    # model from AGENT_MODEL (see agent/llm.py's AgentLLM) so a systemic
+    # issue with the primary model's pool (rate limit, outage) doesn't take
+    # the fallback down with it.
+    AGENT_FALLBACK_MODEL: str = os.getenv("AGENT_FALLBACK_MODEL", "qwen/qwen3.8-27b")
+
     LLM_TEMPERATURE: float = _float("LLM_TEMPERATURE", 0.0)
     LLM_MAX_TOKENS: int = _int("LLM_MAX_TOKENS", 800)
     LLM_TOP_P: float = _float("LLM_TOP_P", 0.90)
+
+    # The Groq SDK retries a failed request (rate limits, transient 5xx)
+    # internally, honoring the API's own Retry-After hint, before raising.
+    # A single /api/chat turn can make several sequential/concurrent Groq
+    # calls (query translation, query rewrite, multiple agent-planning
+    # iterations, final generation) — if the account's tokens-per-minute
+    # quota is tight, each of those calls can independently hit this retry
+    # path, and the backoffs stack into a multi-tens-of-seconds-to-minutes
+    # wall-clock delay for one user-visible request. Made explicit and
+    # configurable here (rather than left at the SDK's internal default) so
+    # this ceiling is visible and tunable instead of an invisible source of
+    # the "hangs, then times out" symptom. See services/llm_provider.py.
+    GROQ_MAX_RETRIES: int = _int("GROQ_MAX_RETRIES", 2)
+    # Hard per-call ceiling so a single Groq request can never hang
+    # indefinitely regardless of retry configuration.
+    GROQ_REQUEST_TIMEOUT_SECONDS: float = _float("GROQ_REQUEST_TIMEOUT_SECONDS", 30.0)
 
     # ── Embeddings ───────────────────────────────────────────────────────
     # Local sentence-transformers model — runs on-device, no API key, no

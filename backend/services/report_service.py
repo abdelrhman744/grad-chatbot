@@ -70,6 +70,7 @@ from config import settings
 from services import storage_service
 from services.llm_provider import get_llm
 from services.rag_service import detect_language, get_document_pages, retrieve
+from utils.prompt_safety import wrap_untrusted_context
 
 log = logging.getLogger("report_service")
 
@@ -160,6 +161,11 @@ _MAP_SCHEMA_HINT = (
 
 
 def _map_extract(slice_text: str, lang: str, index: int, total: int) -> dict:
+    # slice_text is raw text from a user-uploaded document — wrap it with
+    # explicit untrusted-data framing before it reaches the prompt. See
+    # utils/prompt_safety.py.
+    slice_text = wrap_untrusted_context(slice_text, lang)
+
     if lang == "ar":
         prompt = f"""أنت تحلل الجزء {index} من {total} من مستند تقني. استخرج المعلومات التالية بدقة، بالاعتماد فقط على النص المعطى، بدون أي إضافة أو تخمين:
 

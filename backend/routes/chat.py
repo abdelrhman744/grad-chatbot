@@ -10,6 +10,11 @@ from config import settings
 from services.audio_service import transcribe_audio
 from services.rag_service import build_sources_from_dicts, delete_conversation_documents
 from utils import timing
+from utils.conversation_auth import (
+    new_conversation_id,
+    require_valid_conversation_token,
+    sign_conversation_id,
+)
 
 log = logging.getLogger("routes.chat")
 
@@ -36,6 +41,22 @@ class ChatRequest(BaseModel):
     # frontend/lib/conversation.ts). A default here is exactly the silent
     # fallback that let unrelated conversations merge — see Issue 2.
     conversation_id: str
+    # Proof that the caller actually owns conversation_id — see
+    # utils/conversation_auth.py. Obtained once from POST /api/session.
+    conversation_token: str
+
+
+@router.post("/session")
+async def create_session():
+    """
+    Mint a fresh conversation_id and its signature. The frontend calls
+    this once per tab (see frontend/lib/conversation.ts) instead of
+    generating conversation_id itself — the server must be the only party
+    that ever creates one, since a signature is only meaningful for an id
+    the server generated (see utils/conversation_auth.py's docstring).
+    """
+    conversation_id = new_conversation_id()
+    return {"conversation_id": conversation_id, "conversation_token": sign_conversation_id(conversation_id)}
 
 
 def _run_agent(query: str, language: str, conversation_id: str) -> dict:

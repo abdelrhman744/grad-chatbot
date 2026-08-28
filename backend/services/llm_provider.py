@@ -79,7 +79,15 @@ def _get_client() -> Groq:
                 "GROQ_API_KEY is not set. Add it to backend/.env "
                 "(see .env.example) or export it in your environment."
             )
-        _client = Groq(api_key=settings.GROQ_API_KEY)
+        # max_retries/timeout made explicit (not left at the SDK's internal
+        # default) so the worst-case wall-clock cost of a single Groq call
+        # under rate-limiting is a known, tunable quantity — see
+        # settings.GROQ_MAX_RETRIES's docstring in config.py.
+        _client = Groq(
+            api_key=settings.GROQ_API_KEY,
+            max_retries=settings.GROQ_MAX_RETRIES,
+            timeout=settings.GROQ_REQUEST_TIMEOUT_SECONDS,
+        )
     return _client
 
 
