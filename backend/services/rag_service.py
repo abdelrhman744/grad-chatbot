@@ -363,26 +363,58 @@ def _query_needs_llm_variants(query: str) -> bool:
     return not _CODE_LIKE_RE.match(q)
 
 
+# Tried capping max_tokens well below the module default (800) here,
+# reasoning the output is only a small JSON object — reverted after live
+# testing showed it silently breaking Arabic queries entirely (empty
+# response, not truncated JSON): AGENT_MODEL (openai/gpt-oss-20b) is a
+# reasoning-style model that spends part of its token budget on internal
+# reasoning BEFORE the visible JSON output, and that reasoning overhead
+# alone exceeded a 350-token cap for some inputs (Arabic especially),
+# leaving zero budget for the actual answer. The shared get_agent_llm()
+# instance (settings.LLM_MAX_TOKENS=800) is the only budget confirmed
+# reliable for this model — do not lower it without re-testing Arabic
+# inputs specifically, per this exact failure mode.
+_query_variant_llm = get_agent_llm()
+
+
 @lru_cache(maxsize=512)
 def _rewrite_and_translate(query: str, lang: str, max_alternatives: int) -> Tuple[str, Tuple[str, ...], str]:
     """
     ONE combined LLM call replacing the previous two CONCURRENT calls
     (_rewrite_query + _translate, before this change) — same
-    retrieval-variant value (a typo-corrected query, synonym-based
-    alternative phrasings, AND a translation into the other language) from
-    a single Groq round-trip instead of two.
+    retrieval-variant value (synonym-based alternative phrasings AND a
+    translation into the other language, from a single Groq round-trip
+    instead of two), on AGENT_MODEL (the small/fast planner model) instead
+    of GROQ_MODEL — see `_query_variant_llm`'s comment for why a lower
+    max_tokens was tried and reverted here.
 
-    Also moved off GROQ_MODEL (the large answer-generation model) onto
-    AGENT_MODEL (the small/fast planner model, via `get_agent_llm()`):
-    typo-fixing, synonym listing, and short-question translation are
-    well within a small model's capability — the same reasoning
-    config.py's AGENT_MODEL docstring already applies to the planner's
-    JSON routing decision — and this keeps GROQ_MODEL's rate-limit pool
-    reserved for final-answer generation only.
+    The Arabic branch deliberately does NOT ask for a "corrected"
+    (typo-fixed) field, unlike the English branch and unlike this
+    function's pre-merge predecessor (`_rewrite_query`, which asked both
+    languages for it). Live testing found Groq's OWN server-side JSON-mode
+    validator reliably rejects AGENT_MODEL's response with
+    `json_validate_failed` specifically for a "return the same text,
+    corrected" instruction over ARABIC input — reproduced across multiple
+    unrelated Arabic queries, with English inputs of the identical shape
+    unaffected. Since this function swallows all exceptions (by design —
+    a failed reformulation must never break retrieval), that failure was
+    SILENT: it degraded to zero rewrite/translate variants for every
+    Arabic query, with no visible error, no crash, and no benchmark
+    check catching it (the tiny/simple test corpus still retrieved
+    correctly off the untranslated original query alone) — this was only
+    found by testing the raw Groq call directly outside the try/except.
+    Dropping just the "corrected" field from the Arabic prompt (confirmed
+    reliable across several distinct Arabic test queries afterward) keeps
+    the two properties that actually matter for cross-language retrieval
+    (synonym alternatives + translation — the exact case PROFILING.md's
+    cross-language investigation covers) without this failure mode. The
+    English branch keeps "corrected" since it was never observed to fail.
 
-    Returns (corrected_query, alternative_phrasings, translated). Never
-    raises; falls back to ("", (), "") on any parse failure so retrieval
-    still has the original query and local normalized forms to work with.
+    Returns (corrected_query, alternative_phrasings, translated) —
+    corrected is always "" for Arabic queries now, by design (see above).
+    Never raises; falls back to ("", (), "") on any parse failure so
+    retrieval still has the original query and local normalized forms to
+    work with.
     """
     query = _clean(query)
     if not query:
@@ -390,13 +422,12 @@ def _rewrite_and_translate(query: str, lang: str, max_alternatives: int) -> Tupl
 
     if lang == "ar":
         prompt = f"""أعد نتيجة بصيغة JSON فقط (بدون أي نص خارج الـ JSON) لهذا السؤال:
-- "corrected": نفس السؤال بعد تصحيح أي أخطاء إملائية فقط دون تغيير المعنى (أو نفس السؤال حرفيًا إذا لم توجد أخطاء).
 - "alternatives": حتى {max_alternatives} إعادة صياغة قصيرة (جملة واحدة لكل واحدة) لنفس السؤال، باستخدام مرادفات أو مصطلحات بديلة قد تظهر في مستند يتحدث عن هذا الموضوع (مثال: "مميزات" قد تُذكر كـ"فوائد"، و"أفضل" قد تُذكر كـ"أكثر فعالية").
 - "translated": ترجمة هذا السؤال إلى اللغة الإنجليزية فقط.
 
 السؤال: {query}
 
-أعد JSON فقط بهذا الشكل بالضبط، بدون أي شرح: {{"corrected": "...", "alternatives": ["...", "..."], "translated": "..."}}"""
+أعد JSON فقط بهذا الشكل بالضبط، بدون أي شرح: {{"alternatives": ["...", "..."], "translated": "..."}}"""
     else:
         prompt = f"""Return ONLY a JSON object (no text outside the JSON) for this question:
 - "corrected": the same question with only spelling mistakes fixed, meaning unchanged (or the exact same question if there are no mistakes).
@@ -408,7 +439,7 @@ Question: {query}
 Return ONLY JSON in exactly this shape, no explanation: {{"corrected": "...", "alternatives": ["...", "..."], "translated": "..."}}"""
 
     try:
-        out = str(get_agent_llm().invoke(prompt)).strip()
+        out = str(_query_variant_llm.invoke(prompt)).strip()
         match = re.search(r"\{.*\}", out, re.DOTALL)
         data = json.loads(match.group(0)) if match else {}
 
