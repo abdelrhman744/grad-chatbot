@@ -97,14 +97,25 @@ def _edit_distance(a: List[str], b: List[str]) -> int:
     return prev[-1]
 
 
-def cer(reference: str, hypothesis: str) -> float:
+def cer(reference: str, hypothesis: str, strip_diacritics: bool = False) -> float:
+    """strip_diacritics=True removes Arabic tashkeel from BOTH strings
+    before comparing (services.ocr_service.strip_arabic_diacritics) —
+    most RAG/search use cases don't need tashkeel, so a diacritic Tesseract
+    dropped shouldn't count as a "real" error for those callers. Off by
+    default so the raw, diacritics-sensitive number stays available too."""
+    if strip_diacritics:
+        from services.ocr_service import strip_arabic_diacritics
+        reference, hypothesis = strip_arabic_diacritics(reference), strip_arabic_diacritics(hypothesis)
     ref = list(reference.strip())
     if not ref:
         return 0.0 if not hypothesis.strip() else 1.0
     return _edit_distance(ref, list(hypothesis.strip())) / len(ref)
 
 
-def wer(reference: str, hypothesis: str) -> float:
+def wer(reference: str, hypothesis: str, strip_diacritics: bool = False) -> float:
+    if strip_diacritics:
+        from services.ocr_service import strip_arabic_diacritics
+        reference, hypothesis = strip_arabic_diacritics(reference), strip_arabic_diacritics(hypothesis)
     ref = reference.strip().split()
     if not ref:
         return 0.0 if not hypothesis.strip() else 1.0

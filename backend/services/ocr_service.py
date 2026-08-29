@@ -86,6 +86,202 @@ def _merge_ocr_results(results: List[str]) -> str:
     return "\n".join(lines)
 
 
+# ── Post-processing (RTL marks, fractured-line merge, digit handling) ──────
+# Applied to every OCR result (image or PDF page) right before it's
+# returned — see _postprocess_ocr_text, called from _ocr_image_tiered.
+# Added after a real-sample investigation (see
+# scripts/evaluate_printed_ocr_arabic.py) found these specific, reproducible
+# failure patterns in Tesseract's raw `ara+eng` output.
+
+# Bidi control characters (LRM U+200E, RLM U+200F) Tesseract sometimes
+# emits verbatim around Arabic runs — invisible when rendered, but they
+# break exact-text search/comparison downstream. Purely a storage/text
+# concern; stripping them has no effect on how the text would render.
+_RTL_MARKS_RE = re.compile(r"[‎‏]")
+
+# Arabic diacritics (tashkeel/harakat) + tatweel. Opt-in only (see the
+# strip_diacritics parameter on the public functions below) — most
+# RAG/search use cases match on undiacritized text, but a caller that
+# genuinely needs tashkeel preserved (e.g. a linguistics use case) must
+# still be able to get the raw output.
+_ARABIC_DIACRITICS_RE = re.compile(
+    r"[ؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۨ-ۭـ]"
+)
+
+# Arabic-Indic digits (٠-٩) canonicalized to Western digits (0-9) so a
+# document/query using either convention compares equal downstream. A
+# lossless, order-preserving remap of digits Tesseract already recognized
+# AS Arabic-Indic characters — separate from _reocr_digit_regions below,
+# which recovers digits Tesseract misread as a different character/symbol
+# entirely (verified directly: this happens far more often than a clean
+# Arabic-Indic-vs-Western labeling difference — see the investigation).
+_ARABIC_INDIC_DIGITS = "٠١٢٣٤٥٦٧٨٩"
+_WESTERN_DIGITS = "0123456789"
+_DIGIT_NORMALIZE_TABLE = str.maketrans(_ARABIC_INDIC_DIGITS, _WESTERN_DIGITS)
+_ALL_DIGIT_CHARS = set(_ARABIC_INDIC_DIGITS + _WESTERN_DIGITS)
+_DIGIT_TOKEN_ALLOWED_EXTRA = set(".,/-:٫٬،")  # real number/date separators
+
+_SHORT_LINE_MAX_LEN = 15   # a stripped line at/under this length is a merge candidate
+_SHORT_LINE_MAX_RUN = 6    # cap: longer runs look like a real list/TOC, not a fracture
+_LIST_MARKER_RE = re.compile(r"^[\-•*]|^\(?\d+[.)،]")
+
+
+def strip_arabic_diacritics(text: str) -> str:
+    """Remove Arabic diacritics (tashkeel/harakat) and tatweel from `text`.
+    Never called implicitly — see the strip_diacritics parameter on
+    perform_ocr_image_bytes / perform_ocr_pdf_bytes / extract_text."""
+    return _ARABIC_DIACRITICS_RE.sub("", text or "")
+
+
+def _normalize_digits(text: str) -> str:
+    return text.translate(_DIGIT_NORMALIZE_TABLE)
+
+
+def _is_digit_suspect_token(token: str) -> bool:
+    """True for a token that's mostly digit characters but also contains
+    something a real number/date wouldn't (garbled OCR noise mixed in with
+    the digits — e.g. a stray letter or punctuation Tesseract emitted
+    while misreading a digit run). A clean "2026" or "٢٩/٨/٢٠٢٦" is
+    deliberately NOT flagged — nothing to fix. Deliberately conservative:
+    verified directly (evaluate_printed_ocr_arabic.py) that some real
+    garbled digit output (e.g. "51/84", "171040" — Tesseract's misreading
+    of a 10-digit Arabic-Indic run) still passes this check uncaught,
+    because it happens to look syntactically like a clean number/date —
+    this heuristic catches noise-contaminated tokens, not tokens that are
+    simply the wrong digits. See _reocr_digit_regions's docstring."""
+    if not token:
+        return False
+    digit_count = sum(1 for c in token if c in _ALL_DIGIT_CHARS)
+    if digit_count / len(token) < 0.4:
+        return False
+    extra = set(token) - _ALL_DIGIT_CHARS - _DIGIT_TOKEN_ALLOWED_EXTRA
+    return bool(extra)
+
+
+def _run_tesseract_digit_whitelist(img: np.ndarray) -> str:
+    """Re-run Tesseract on the SAME image with the character set restricted
+    to digits only. Verified directly (evaluate_printed_ocr_arabic.py):
+    Tesseract's default ara+eng pass badly garbles an Arabic-Indic digit
+    run surrounded by Arabic prose (e.g. "٠١٢٣٤٥٦٧٨٩" -> "١17740517085"),
+    but a whitelist-only pass over the exact same image recovers it almost
+    perfectly ("01234567894" — the correct 0-9 sequence, one stray extra
+    digit). Never raises — returns "" on failure, same contract as
+    _run_tesseract."""
+    config = (
+        "--oem 1 --psm 6 -l ara+eng -c tessedit_char_whitelist="
+        + _WESTERN_DIGITS + _ARABIC_INDIC_DIGITS
+    )
+    try:
+        return pytesseract.image_to_string(Image.fromarray(img), config=config).strip()
+    except Exception as e:
+        log.debug(f"digit-whitelist tesseract error: {e}")
+        return ""
+
+
+def _reocr_digit_regions(img: np.ndarray, text: str) -> str:
+    """
+    If `text` contains a digit-suspect token (see _is_digit_suspect_token),
+    pay for ONE extra Tesseract call — a digit-only-whitelist pass over the
+    same image (_run_tesseract_digit_whitelist) — and splice its
+    cleanly-recognized digit runs back into `text` in left-to-right token
+    order. Skipped entirely (no extra Tesseract call) when no token looks
+    digit-suspect, which keeps the common non-numeric case at its existing
+    single-call cost — same "only pay for what you need" design as
+    _ocr_image_tiered's own tiering.
+
+    Known limitation (found via re-running the fix against the same real
+    garbled sample that motivated it — not assumed away): the trigger
+    heuristic is intentionally conservative to avoid corrupting a
+    legitimately-recognized number elsewhere in a document, so it does NOT
+    fire on every garbled digit run — e.g. "51/84"/"171040" (Tesseract's
+    actual misreading of a 10-digit Arabic-Indic string) both look
+    syntactically like a clean number/date and pass _is_digit_suspect_token
+    uncaught. The whitelist-only re-OCR pass itself IS accurate when it
+    does run (verified directly: recovered "01234567894" — the correct
+    0-9 sequence, one stray extra digit — from an image whose default pass
+    produced "17740517085"); the gap is in reliably detecting WHEN to
+    trigger it from text alone, not in the recovery itself.
+    """
+    tokens = text.split(" ")
+    suspect_indices = [i for i, t in enumerate(tokens) if _is_digit_suspect_token(t)]
+    if not suspect_indices:
+        return text
+
+    whitelist_text = _run_tesseract_digit_whitelist(img)
+    digit_runs = re.findall(r"[0-9٠-٩]+", whitelist_text)
+    if not digit_runs:
+        return text
+
+    for position, idx in enumerate(suspect_indices):
+        if position < len(digit_runs):
+            tokens[idx] = digit_runs[position]
+    return " ".join(tokens)
+
+
+def _merge_fractured_lines(text: str) -> str:
+    """
+    Merge runs of consecutive very-short lines that are almost certainly a
+    single source line Tesseract's PSM mis-split into fragments — verified
+    directly against a real ligature-heavy Arabic line
+    (evaluate_printed_ocr_arabic.py): one input line came back as 6+
+    separate short/garbled lines. Deliberately conservative: only lines
+    with no blank-line separator between them, that don't look like an
+    intentional list/heading marker (_LIST_MARKER_RE), and only up to
+    _SHORT_LINE_MAX_RUN in a row — a longer run of short lines looks more
+    like a genuine list/table-of-contents than a fracture, so it's left
+    alone. Never touches "[Page N]" markers (perform_ocr_pdf_bytes) since
+    those are always separated from surrounding text by blank lines.
+    """
+    lines = text.split("\n")
+    merged: List[str] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if not stripped or len(stripped) > _SHORT_LINE_MAX_LEN or _LIST_MARKER_RE.match(stripped):
+            merged.append(lines[i])
+            i += 1
+            continue
+
+        run = [stripped]
+        j = i + 1
+        while (
+            j < len(lines)
+            and len(run) < _SHORT_LINE_MAX_RUN
+            and lines[j].strip()
+            and len(lines[j].strip()) <= _SHORT_LINE_MAX_LEN
+            and not _LIST_MARKER_RE.match(lines[j].strip())
+        ):
+            run.append(lines[j].strip())
+            j += 1
+
+        merged.append(" ".join(run) if len(run) >= 2 else lines[i])
+        i = j
+
+    return "\n".join(merged)
+
+
+def _postprocess_ocr_text(text: str, img: Optional[np.ndarray] = None) -> str:
+    """Applied to every OCR result before it's returned. `img` (the
+    preprocessed array OCR actually ran against), when available, enables
+    the digit-region re-OCR pass; text-only cleanup still runs without it
+    (e.g. the raw-fallback path in perform_ocr_image_bytes)."""
+    if not text:
+        return text
+    # RTL marks stripped FIRST — a stray LRM/RLM glued directly onto a
+    # digit token (observed directly: '‎٠‏') would otherwise
+    # dilute its digit-character ratio enough to dodge
+    # _is_digit_suspect_token's threshold.
+    text = _RTL_MARKS_RE.sub("", text)
+    if img is not None:
+        try:
+            text = _reocr_digit_regions(img, text)
+        except Exception as e:
+            log.debug(f"digit-region re-OCR post-process step failed, skipping: {e}")
+    text = _merge_fractured_lines(text)
+    text = _normalize_digits(text)
+    return text
+
+
 def _ocr_result_confident(text: str) -> bool:
     """
     Cheap, deterministic heuristic used ONLY to decide whether a single
@@ -124,6 +320,7 @@ def _ocr_image_tiered(img: np.ndarray, strategies: List[str], psm_modes: List[in
     """
     best_strategy, best_psm = strategies[0], psm_modes[0]
     first_text = ""
+    processed = None
     try:
         processed = _preprocess_for_ocr(img, best_strategy)
         first_text = _run_tesseract(processed, best_psm)
@@ -131,7 +328,7 @@ def _ocr_image_tiered(img: np.ndarray, strategies: List[str], psm_modes: List[in
         log.debug(f"tiered OCR first pass failed (strategy={best_strategy}, psm={best_psm}): {e}")
 
     if _ocr_result_confident(first_text):
-        return first_text
+        return _postprocess_ocr_text(first_text, processed)
 
     # Escalate: run every other combination too and merge everything,
     # exactly like the original always-run-all behavior — this only fires
@@ -142,13 +339,17 @@ def _ocr_image_tiered(img: np.ndarray, strategies: List[str], psm_modes: List[in
             if strategy == best_strategy and psm == best_psm:
                 continue
             try:
-                processed = _preprocess_for_ocr(img, strategy)
-                text = _run_tesseract(processed, psm)
+                processed_variant = _preprocess_for_ocr(img, strategy)
+                text = _run_tesseract(processed_variant, psm)
                 if text:
                     results.append(text)
             except Exception:
                 continue
-    return _merge_ocr_results(results)
+    merged = _merge_ocr_results(results)
+    # Digit re-OCR needs ONE representative preprocessed image — the
+    # first/best strategy's, same one used for the fast-path case above —
+    # rather than re-running it against every escalation variant.
+    return _postprocess_ocr_text(merged, processed)
 
 
 def _decode_image_bytes(data: bytes) -> Optional[np.ndarray]:
@@ -167,8 +368,11 @@ def _decode_image_bytes(data: bytes) -> Optional[np.ndarray]:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def perform_ocr_image_bytes(data: bytes) -> str:
-    """Run OCR on raw image bytes (tiered — see _ocr_image_tiered)."""
+def perform_ocr_image_bytes(data: bytes, strip_diacritics: bool = False) -> str:
+    """Run OCR on raw image bytes (tiered — see _ocr_image_tiered).
+    strip_diacritics=True additionally removes Arabic tashkeel/harakat from
+    the result (see strip_arabic_diacritics) — off by default, since not
+    every caller wants diacritics discarded."""
     merged = ""
     try:
         img = _decode_image_bytes(data)
@@ -183,18 +387,22 @@ def perform_ocr_image_bytes(data: bytes) -> str:
             merged = pytesseract.image_to_string(
                 Image.open(io.BytesIO(data)), lang="ara+eng", config="--oem 1 --psm 6"
             ).strip()
+            merged = _postprocess_ocr_text(merged)
         except Exception:
             pass
+
+    if strip_diacritics:
+        merged = strip_arabic_diacritics(merged)
 
     log.info(f"OCR image → {len(merged)} chars")
     return merged
 
 
-def perform_ocr_image_path(file_path: str) -> str:
+def perform_ocr_image_path(file_path: str, strip_diacritics: bool = False) -> str:
     """Run OCR on an image file path."""
     try:
         with open(file_path, "rb") as f:
-            return perform_ocr_image_bytes(f.read())
+            return perform_ocr_image_bytes(f.read(), strip_diacritics=strip_diacritics)
     except Exception as e:
         log.error(f"OCR image path error: {e}")
         return ""
@@ -204,7 +412,7 @@ def _ocr_max_workers(n_pages: int) -> int:
     return max(1, min(settings.OCR_MAX_CONCURRENT_PAGES, n_pages))
 
 
-def perform_ocr_pdf_bytes(data: bytes) -> str:
+def perform_ocr_pdf_bytes(data: bytes, strip_diacritics: bool = False) -> str:
     """
     Convert every PDF page to an image and OCR it: bounded page-level
     parallelism (at most settings.OCR_MAX_CONCURRENT_PAGES pages — and
@@ -246,11 +454,15 @@ def perform_ocr_pdf_bytes(data: bytes) -> str:
     # page_texts is indexed by page number, so joining in list order
     # preserves the original page order regardless of completion order.
     result = "\n\n".join(t for t in page_texts if t)
+    if strip_diacritics:
+        result = strip_arabic_diacritics(result)
     log.info(f"OCR PDF → {len(result)} chars from {len(pages)} page(s) (max_workers={max_workers})")
     return result
 
 
-def perform_ocr_pdf_pages_bytes(data: bytes, page_indices: List[int]) -> Dict[int, str]:
+def perform_ocr_pdf_pages_bytes(
+    data: bytes, page_indices: List[int], strip_diacritics: bool = False
+) -> Dict[int, str]:
     """
     OCR only the given 0-based page indices of a PDF, instead of the whole
     document — used by loaders/pdf_loader.py for a MIXED text+scanned PDF,
@@ -276,6 +488,8 @@ def perform_ocr_pdf_pages_bytes(data: bytes, page_indices: List[int]) -> Dict[in
                 return
             img = cv2.cvtColor(np.array(rendered[0].convert("RGB")), cv2.COLOR_RGB2BGR)
             text = _ocr_image_tiered(img, PDF_OCR_STRATEGIES, PDF_OCR_PSM_MODES)
+            if strip_diacritics:
+                text = strip_arabic_diacritics(text)
             if text:
                 with lock:
                     results[index] = text
@@ -295,22 +509,22 @@ def perform_ocr_pdf_pages_bytes(data: bytes, page_indices: List[int]) -> Dict[in
     return results
 
 
-def perform_ocr_pdf_path(file_path: str) -> str:
+def perform_ocr_pdf_path(file_path: str, strip_diacritics: bool = False) -> str:
     try:
         with open(file_path, "rb") as f:
-            return perform_ocr_pdf_bytes(f.read())
+            return perform_ocr_pdf_bytes(f.read(), strip_diacritics=strip_diacritics)
     except Exception as e:
         log.error(f"OCR PDF path error: {e}")
         return ""
 
 
-def extract_text(filename: str, data: bytes) -> str:
+def extract_text(filename: str, data: bytes, strip_diacritics: bool = False) -> str:
     """Dispatch to the right extractor based on file extension."""
     ext = filename.lower().rsplit(".", 1)[-1]
     if ext == "pdf":
-        return perform_ocr_pdf_bytes(data)
+        return perform_ocr_pdf_bytes(data, strip_diacritics=strip_diacritics)
     if ext in {"png", "jpg", "jpeg", "tiff", "bmp", "webp"}:
-        return perform_ocr_image_bytes(data)
+        return perform_ocr_image_bytes(data, strip_diacritics=strip_diacritics)
     try:
         return data.decode("utf-8", errors="replace").strip()
     except Exception:
