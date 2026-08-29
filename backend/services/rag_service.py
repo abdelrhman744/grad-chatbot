@@ -46,7 +46,7 @@ from loaders.registry import (
 )
 from services.db_service import get_client, get_collection_name, ensure_collection, with_retries
 from services.embeddings_provider import get_embeddings
-from services.llm_provider import GroqLLM, get_llm as _get_shared_llm
+from services.llm_provider import GroqLLM, get_llm as _get_shared_llm, get_agent_llm
 from services import storage_service
 from utils import timing
 from utils.prompt_safety import wrap_untrusted_context
@@ -314,24 +314,6 @@ def _run_concurrent(tasks: List) -> List:
     return timing.run_concurrent_ctx(tasks)
 
 
-@lru_cache(maxsize=512)
-def _translate(text: str, target_lang: str) -> str:
-    text = _clean(text)
-    if not text:
-        return ""
-    prompt = (
-        f"Translate this Arabic text to English. Return ONLY the translation:\n{text}"
-        if target_lang == "en"
-        else f"Translate this English text to Arabic. Return ONLY the translation:\n{text}"
-    )
-    try:
-        out = str(llm.invoke(prompt)).strip()
-        return _clean(re.split(r"\n\n", out)[0])
-    except Exception as e:
-        log.warning(f"Translation failed: {e}")
-        return ""
-
-
 def _is_mixed_language(text: str) -> bool:
     return bool(re.search(r"[\u0600-\u06FF]", text or "")) and bool(re.search(r"[a-zA-Z]", text or ""))
 
@@ -350,49 +332,90 @@ def _loose_english(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-@lru_cache(maxsize=256)
-def _rewrite_query(query: str, lang: str, max_alternatives: int) -> Tuple[str, Tuple[str, ...]]:
-    """
-    Single combined LLM call that replaces what used to be up to 3 separate
-    sequential calls (spelling-fix + rephrase + concept-expand) for the same
-    (query, lang) pair — same retrieval-variant value (a corrected query,
-    plus synonym-based alternative phrasings that help semantic/evaluative
-    questions match document wording that doesn't share the user's exact
-    vocabulary), at roughly a third of the LLM round-trips.
+# Single-token queries that look like a bare identifier — an IP address,
+# hostname, URL, error code with a numeric part, version string, etc. —
+# have nothing for an LLM to usefully translate or paraphrase: there's no
+# natural-language content to fix typos in or find synonyms for, and
+# "translating" "192.168.1.1" is meaningless. Skipping the LLM call for
+# these is safe — local normalization (_normalize/_loose_*) still runs on
+# them exactly as for any other query, so they keep variant coverage, just
+# not synonym/translation variants that wouldn't help.
+#
+# Deliberately requires a digit or a '.'/'/'/':'  — NOT just "single token,
+# no spaces" — so a plain single-word acronym/topic query (e.g. "PEAS",
+# "blockchain") still gets the full rewrite/translate pass. A bare word
+# like that is exactly the case PROFILING.md's cross-language investigation
+# tested (an Arabic-only query needing translation to match an
+# English-only document, and vice versa) — skipping translation for it
+# would silently reintroduce that exact recall gap. An identifier-like
+# error code with no digit/separator at all (e.g. "ERR_CONN_TIMEOUT")
+# isn't matched either — it still gets one (cheap, fast-model) LLM call
+# rather than risk under-matching a real word.
+_CODE_LIKE_RE = re.compile(r"^[\w\-\.:/]*[\d./:][\w\-\.:/]*$")
 
-    Returns (corrected_query, alternative_phrasings). Never raises; falls
-    back to ("", ()) on any parse failure so retrieval still has the
-    original query and normalized forms to work with even if this
-    particular reformulation fails.
+
+def _query_needs_llm_variants(query: str) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return False
+    if " " in q:
+        return True
+    return not _CODE_LIKE_RE.match(q)
+
+
+@lru_cache(maxsize=512)
+def _rewrite_and_translate(query: str, lang: str, max_alternatives: int) -> Tuple[str, Tuple[str, ...], str]:
+    """
+    ONE combined LLM call replacing the previous two CONCURRENT calls
+    (_rewrite_query + _translate, before this change) — same
+    retrieval-variant value (a typo-corrected query, synonym-based
+    alternative phrasings, AND a translation into the other language) from
+    a single Groq round-trip instead of two.
+
+    Also moved off GROQ_MODEL (the large answer-generation model) onto
+    AGENT_MODEL (the small/fast planner model, via `get_agent_llm()`):
+    typo-fixing, synonym listing, and short-question translation are
+    well within a small model's capability — the same reasoning
+    config.py's AGENT_MODEL docstring already applies to the planner's
+    JSON routing decision — and this keeps GROQ_MODEL's rate-limit pool
+    reserved for final-answer generation only.
+
+    Returns (corrected_query, alternative_phrasings, translated). Never
+    raises; falls back to ("", (), "") on any parse failure so retrieval
+    still has the original query and local normalized forms to work with.
     """
     query = _clean(query)
     if not query:
-        return "", ()
+        return "", (), ""
 
     if lang == "ar":
         prompt = f"""أعد نتيجة بصيغة JSON فقط (بدون أي نص خارج الـ JSON) لهذا السؤال:
 - "corrected": نفس السؤال بعد تصحيح أي أخطاء إملائية فقط دون تغيير المعنى (أو نفس السؤال حرفيًا إذا لم توجد أخطاء).
 - "alternatives": حتى {max_alternatives} إعادة صياغة قصيرة (جملة واحدة لكل واحدة) لنفس السؤال، باستخدام مرادفات أو مصطلحات بديلة قد تظهر في مستند يتحدث عن هذا الموضوع (مثال: "مميزات" قد تُذكر كـ"فوائد"، و"أفضل" قد تُذكر كـ"أكثر فعالية").
+- "translated": ترجمة هذا السؤال إلى اللغة الإنجليزية فقط.
 
 السؤال: {query}
 
-أعد JSON فقط بهذا الشكل بالضبط، بدون أي شرح: {{"corrected": "...", "alternatives": ["...", "..."]}}"""
+أعد JSON فقط بهذا الشكل بالضبط، بدون أي شرح: {{"corrected": "...", "alternatives": ["...", "..."], "translated": "..."}}"""
     else:
         prompt = f"""Return ONLY a JSON object (no text outside the JSON) for this question:
 - "corrected": the same question with only spelling mistakes fixed, meaning unchanged (or the exact same question if there are no mistakes).
 - "alternatives": up to {max_alternatives} short alternative phrasings (one sentence each) of the same question, using synonyms or alternative terms that might appear in a document about this topic (e.g. "advantages" might appear as "benefits", "better" as "more effective").
+- "translated": a translation of this question into Arabic only.
 
 Question: {query}
 
-Return ONLY JSON in exactly this shape, no explanation: {{"corrected": "...", "alternatives": ["...", "..."]}}"""
+Return ONLY JSON in exactly this shape, no explanation: {{"corrected": "...", "alternatives": ["...", "..."], "translated": "..."}}"""
 
     try:
-        out = str(llm.invoke(prompt)).strip()
+        out = str(get_agent_llm().invoke(prompt)).strip()
         match = re.search(r"\{.*\}", out, re.DOTALL)
         data = json.loads(match.group(0)) if match else {}
+
         corrected = _clean(str(data.get("corrected") or ""))
         if corrected.lower() == query.lower():
             corrected = ""
+
         alts_raw = data.get("alternatives") or []
         alternatives = tuple(
             dict.fromkeys(  # de-dupe while preserving order
@@ -400,10 +423,13 @@ Return ONLY JSON in exactly this shape, no explanation: {{"corrected": "...", "a
                 if a and a.lower() != query.lower()
             )
         )
-        return corrected, alternatives
+
+        translated = _clean(re.split(r"\n\n", str(data.get("translated") or ""))[0])
+
+        return corrected, alternatives, translated
     except Exception as e:
-        log.warning(f"Query rewrite failed for lang={lang}: {e}")
-        return "", ()
+        log.warning(f"Query rewrite+translate failed for lang={lang}: {e}")
+        return "", (), ""
 
 
 def _query_variants(question: str, lang: str) -> List[str]:
@@ -415,12 +441,16 @@ def _query_variants(question: str, lang: str) -> List[str]:
     - a translation into whichever language the query is NOT already in
       (+ its local, non-LLM normalized/loose forms)
 
-    Only TWO Groq calls are made here (down from up to five — see Issue 1
-    investigation): rewriting the original query (typo-fix + synonym
-    alternatives) and translating it into the other language are
-    independent, so they run concurrently via _run_concurrent instead of
-    one-by-one — see the docstring there. Two LLM-powered passes that used
-    to run on top of this were removed as redundant, not just slow:
+    ONE Groq call is made here (down from two concurrent calls, down from
+    up to five before that — see Issue 1 investigation): rewriting the
+    original query (typo-fix + synonym alternatives) AND translating it
+    into the other language are now a single combined call — see
+    `_rewrite_and_translate`'s docstring for why merging (not just running
+    concurrently) is safe and preferable here, and for the move to the
+    fast model. Skipped entirely for single-token identifier-like queries
+    (IPs, hostnames, error codes, ...) — see `_query_needs_llm_variants`.
+    Two LLM-powered passes that used to run on top of this were removed
+    earlier as redundant, not just slow:
     - Translating into BOTH "en" and "ar" unconditionally used to fire
       regardless of the query's actual language, so one of the two calls
       was always given the wrong-language instruction (e.g. "translate
@@ -459,28 +489,14 @@ def _query_variants(question: str, lang: str) -> List[str]:
         add(q.lower())
         add(_loose_english(q))
 
-    # Rewriting the original query and translating it into the other
-    # language are fully independent LLM calls — run concurrently.
     max_alts = 3 if settings.QUERY_EXPANSION_ENABLED else 1
     target_lang = "ar" if detected == "en" else "en"
 
-    # Each lambda is ALSO individually timed (query_rewrite_ms /
-    # translate_ms) in addition to the existing combined
-    # query_rewrite_and_translate substage — the two calls run
-    # concurrently on different threads but write to DIFFERENT substage
-    # names, so there is no read-modify-write race on the same dict key
-    # (see RequestTimer.record_substage). Pure instrumentation: same two
-    # calls, same arguments, same concurrency pattern as before.
-    def _timed_rewrite():
-        with timing.substage("query_rewrite_ms"):
-            return _rewrite_query(q, detected, max_alts)
-
-    def _timed_translate():
-        with timing.substage("translate_ms"):
-            return _translate(q, target_lang)
-
-    with timing.substage("query_rewrite_and_translate"):
-        (fixed, alternatives), translated = _run_concurrent([_timed_rewrite, _timed_translate])
+    if _query_needs_llm_variants(q):
+        with timing.substage("query_rewrite_and_translate"):
+            fixed, alternatives, translated = _rewrite_and_translate(q, detected, max_alts)
+    else:
+        fixed, alternatives, translated = "", (), ""
 
     for alt in alternatives:
         add(alt)
@@ -720,7 +736,7 @@ def _add_raw_question_anchor(
     be stable run-to-run even at temperature 0 (documented already in
     Agent._correct_premature_terminal's docstring for tool CHOICE; the same
     non-determinism applies to the free-text query it writes). Since
-    `_rewrite_query`/`_translate` are cached by exact query string, a
+    `_rewrite_and_translate` is cached by exact query string, so a
     different planner phrasing is a full cache miss that can pull in a
     different candidate pool for what the user experiences as "the exact
     same question". Anchoring on the raw literal text — which never comes
@@ -948,27 +964,27 @@ def build_prompt(context: str, question: str, lang: str) -> str:
     # on, never as something to obey. See utils/prompt_safety.py.
     context = wrap_untrusted_context(context, lang)
 
+    # Compressed as part of a latency/token-optimization pass — see the
+    # speed-optimization report. Only STYLE/formatting rules were merged
+    # (old 1+2+3 -> 1, old 9+9b+9c -> 5, old 11+12+13 -> 7); the grounding
+    # / anti-hallucination / refusal rules (old 4/5/6, now 2/3) are kept
+    # essentially verbatim — these are the actual quality gate (grounded
+    # vs. ungrounded refusal correctness) and the highest-risk rules to
+    # weaken. Re-verify refusal behavior after any further edit here — see
+    # scripts/evaluate_agent_token_and_quality.py's ungrounded scenarios.
     if lang == "ar":
         return f"""أنت نظام استخراج معلومات متقدم. مهمتك: استخرج إجابة كاملة ومفصّلة من السياق المقدم فقط.
 
 **قواعد الإجابة — يجب اتباعها بدقة:**
 
-1. اقرأ السياق كاملاً قبل الكتابة.
-2. السؤال قد يكون بالعربية والسياق بالإنجليزية أو العكس؛ افهم المعنى بين اللغتين.
-3. السؤال قد يحتوي على أخطاء إملائية أو حروف ناقصة أو كلمات عامية؛ حاول فهم المقصود من السياق.
-4. أجب من السياق فقط إذا كان يحتوي بشكل مباشر ومحدد على المعلومة المطلوبة في السؤال — وليس مجرد موضوع مشابه أو قريب.
-5. إذا كان السياق لا يحتوي على المعلومة المحددة المطلوبة، يجب أن تقول "المعلومة غير موجودة في الملفات المرفوعة." لا تجب إجابة جزئية بالاعتماد على فقرة قريبة الموضوع فقط، ولا تسد الفجوة بمعرفتك الخاصة — حتى لو كنت متأكدًا أنها معلومة صحيحة في الواقع. هذا النظام يجب أن يجيب حصريًا من المستندات المرفوعة، ولا شيء غير ذلك.
-6. لا تستخدم أي معرفة خارجية خارج السياق تحت أي ظرف، حتى للأسئلة التي تستطيع الإجابة عنها بسهولة بنفسك (حقائق عامة، تعريفات، أحداث جارية، إلخ). إذا لم تكن المعلومة في السياق، فلا تضعها في الإجابة.
-7. لا تبدأ بعبارات مثل "بناءً على السياق" أو "وفقاً للمعلومات".
-8. لا تكرر السؤال في الإجابة.
-9. اذكر الأرقام والتواريخ والأسماء كما وردت في السياق.
-9ب. حافظ على المعادلات والصيغ والوحدات والمصطلحات التقنية كما هي بالضبط في السياق؛ لا تعيد صياغتها أو تقرّبها أو تبسّطها.
-9ج. لا تخترع رقمًا أو اسمًا أو مصطلحًا أو حقيقة غير موجودة في السياق، حتى لو كان ذلك لسد فجوة أو لجعل الإجابة تبدو مكتملة.
-10. أجب دائمًا بنفس لغة سؤال المستخدم في هذه الرسالة، بغض النظر عن لغة المستند المصدر. لا تُغيّر اللغة من تلقاء نفسك. حافظ على المصطلحات الإنجليزية المهمة كما هي عند الحاجة.
-11. أجب مباشرة وبإيجاز، وطابق حجم الإجابة مع حجم السؤال: سؤال بسيط ومباشر (تعريف، تاريخ، اسم، رقم) يستحق إجابة قصيرة ومباشرة بدون إطالة؛ سؤال تقني أو مفاهيمي معقد يستحق شرحًا واضحًا بالقدر اللازم فقط.
-12. لا تضف مثالًا تلقائيًا لكل إجابة. أضف مثالًا فقط إذا كان المفهوم غير بديهي ويستفيد فعلاً من التوضيح، أو إذا طلب المستخدم مثالًا صراحة.
-13. لا تفرض تنسيقًا ثابتًا مثل "الشرح:/المثال:" — اكتب نثرًا طبيعيًا منظمًا، واستخدم نقاطًا فقط عندما يكون المحتوى قائمة فعلية تستفيد من ذلك.
-14. بعض أجزاء السياق مصدرها ملف إكسل/جدول بيانات، ويظهر ذلك في ترويسة الجزء (مثل "Sheet: Sales | Rows 12-20") وفي نص الصف بصيغة "Row N: العمود: القيمة | العمود: القيمة". اقرأ كل صف كسجل بيانات منفصل تربط فيه كل قيمة باسم عمودها. إذا احتجت لتجميع قيم من عدة صفوف (مجموع، عدد، أكبر قيمة، إلخ)، استخدم فقط الصفوف الظاهرة فعليًا في السياق؛ وإذا كان من الواضح أن السياق يحتوي على بعض الصفوف فقط وليس كل الجدول، فوضّح أن إجابتك مبنية على الصفوف المتاحة فقط ولا تدّعي أنها شاملة لكل البيانات.
+1. اقرأ السياق كاملاً قبل الكتابة. قد يكون السؤال بالعربية والسياق بالإنجليزية أو العكس، وقد يحتوي السؤال على أخطاء إملائية أو حروف ناقصة أو كلمات عامية — افهم المعنى المقصود من السياق رغم ذلك.
+2. أجب من السياق فقط إذا كان يحتوي بشكل مباشر ومحدد على المعلومة المطلوبة في السؤال — وليس مجرد موضوع مشابه أو قريب.
+3. إذا كان السياق لا يحتوي على المعلومة المحددة المطلوبة، يجب أن تقول "المعلومة غير موجودة في الملفات المرفوعة." لا تجب إجابة جزئية بالاعتماد على فقرة قريبة الموضوع فقط، ولا تسد الفجوة بمعرفتك الخاصة — حتى لو كنت متأكدًا أنها معلومة صحيحة في الواقع. لا تستخدم أي معرفة خارجية خارج السياق تحت أي ظرف، حتى للأسئلة التي تستطيع الإجابة عنها بسهولة بنفسك. إذا لم تكن المعلومة في السياق، فلا تضعها في الإجابة.
+4. لا تبدأ بعبارات مثل "بناءً على السياق" أو "وفقاً للمعلومات"، ولا تكرر السؤال في الإجابة.
+5. اذكر الأرقام والتواريخ والأسماء والمعادلات والصيغ والوحدات والمصطلحات التقنية كما وردت بالضبط في السياق؛ لا تعيد صياغتها أو تقرّبها أو تبسّطها، ولا تخترع رقمًا أو اسمًا أو مصطلحًا غير موجود، حتى لو كان ذلك لسد فجوة أو لجعل الإجابة تبدو مكتملة.
+6. أجب دائمًا بنفس لغة سؤال المستخدم في هذه الرسالة، بغض النظر عن لغة المستند المصدر. لا تُغيّر اللغة من تلقاء نفسك. حافظ على المصطلحات الإنجليزية المهمة كما هي عند الحاجة.
+7. أجب مباشرة وبإيجاز، وطابق حجم الإجابة مع حجم السؤال: سؤال بسيط ومباشر يستحق إجابة قصيرة بدون إطالة؛ سؤال تقني أو مفاهيمي معقد يستحق شرحًا واضحًا بالقدر اللازم فقط. أضف مثالًا فقط إذا كان المفهوم غير بديهي أو طلبه المستخدم صراحة. اكتب نثرًا طبيعيًا منظمًا، لا تنسيقًا ثابتًا مثل "الشرح:/المثال:" — واستخدم نقاطًا فقط عندما يكون المحتوى قائمة فعلية.
+8. بعض أجزاء السياق مصدرها ملف إكسل/جدول بيانات، ويظهر ذلك في ترويسة الجزء (مثل "Sheet: Sales | Rows 12-20") وفي نص الصف بصيغة "Row N: العمود: القيمة | العمود: القيمة". اقرأ كل صف كسجل بيانات منفصل تربط فيه كل قيمة باسم عمودها. إذا احتجت لتجميع قيم من عدة صفوف، استخدم فقط الصفوف الظاهرة فعليًا في السياق، ووضّح أن إجابتك مبنية على الصفوف المتاحة فقط وليست شاملة لكل البيانات.
 
 **السياق:**
 {context}
@@ -982,22 +998,14 @@ def build_prompt(context: str, question: str, lang: str) -> str:
 
 **Answering rules — follow precisely:**
 
-1. Read the entire context before writing.
-2. The question and context may be in different languages. Understand the meaning across Arabic and English.
-3. The question may contain spelling mistakes, missing letters, dialect words, or mixed Arabic/English terms. Infer the intended meaning from the context.
-4. Answer using the context ONLY if it specifically and directly contains the information the question is asking for — not merely a related or similar topic.
-5. If the context does not contain the specific information requested, you MUST say "The information is not available in the uploaded files." Do not partially answer using a superficially related passage, and do not fill the gap with your own knowledge — even if you are confident it is correct real-world information. This system must answer strictly from the uploaded documents, nothing else.
-6. Do not use external knowledge outside the context, under any circumstance, even for questions you could easily answer yourself (general facts, definitions, current events, etc.). If it isn't in the context, it isn't in the answer.
-7. Do not open with "Based on the context" or "According to the information".
-8. Do not repeat the question.
-9. State numbers, dates, and names exactly as they appear in the context.
-9b. Preserve equations, formulas, units, and technical terms exactly as written in the context — do not paraphrase, round, or simplify them.
-9c. Never invent a number, name, term, or fact that is not present in the context, even to fill a gap or sound complete.
-10. Always answer in the same language as the user's question in this message, regardless of the source document's language. Never switch language on your own. Preserve important Arabic or English technical terms when needed.
-11. Answer directly and concisely, and match the length of your answer to the question: a simple, direct question (a definition, a date, a name, a number) deserves a short, direct answer — no padding. A complex or technical/conceptual question deserves a clear explanation, but only as long as it needs to be.
-12. Do not add an example to every answer by default. Include an example only when the concept is genuinely non-obvious and an example would meaningfully aid understanding, or when the user explicitly asked for one.
-13. Do not impose a fixed section structure (no forced "Explanation:/Example:" labels). Write natural, well-organized prose; use bullet points only when the content is genuinely a list and benefits from one.
-14. Some context chunks come from an Excel/spreadsheet file — you can tell from the chunk header (e.g. "Sheet: Sales | Rows 12-20") and from row text formatted as "Row N: Column: Value | Column: Value". Read each row as its own record, matching every value to its column name. If the question requires aggregating across several rows (a total, a count, a maximum, etc.), use only the rows actually present in the context; if the context clearly only contains some of a sheet's rows rather than the whole table, say your answer is based only on the rows available rather than implying it covers the entire dataset.
+1. Read the entire context before writing. The question and context may be in different languages (Arabic/English), and the question may contain spelling mistakes, missing letters, dialect words, or mixed terms — infer the intended meaning from the context regardless.
+2. Answer using the context ONLY if it specifically and directly contains the information the question is asking for — not merely a related or similar topic.
+3. If the context does not contain the specific information requested, you MUST say "The information is not available in the uploaded files." Do not partially answer using a superficially related passage, and do not fill the gap with your own knowledge — even if you are confident it is correct real-world information. This system must answer strictly from the uploaded documents, nothing else. Do not use external knowledge outside the context under any circumstance, even for questions you could easily answer yourself (general facts, definitions, current events, etc.). If it isn't in the context, it isn't in the answer.
+4. Do not open with "Based on the context" or "According to the information", and do not repeat the question.
+5. State numbers, dates, names, equations, formulas, units, and technical terms exactly as they appear in the context — do not paraphrase, round, or simplify them, and never invent one that isn't present, even to fill a gap or sound complete.
+6. Always answer in the same language as the user's question in this message, regardless of the source document's language. Never switch language on your own. Preserve important Arabic or English technical terms when needed.
+7. Answer directly and concisely, matching length to the question: a simple, direct question (a definition, a date, a name, a number) deserves a short, direct answer with no padding; a complex or technical/conceptual question deserves a clear explanation, only as long as it needs to be. Include an example only when the concept is genuinely non-obvious and it would meaningfully aid understanding, or the user explicitly asked for one. Write natural, well-organized prose, not a forced "Explanation:/Example:" structure — use bullet points only when the content is genuinely a list.
+8. Some context chunks come from an Excel/spreadsheet file — you can tell from the chunk header (e.g. "Sheet: Sales | Rows 12-20") and from row text formatted as "Row N: Column: Value | Column: Value". Read each row as its own record, matching every value to its column name. If the question requires aggregating across several rows (a total, a count, a maximum, etc.), use only the rows actually present in the context; if the context clearly only contains some of a sheet's rows rather than the whole table, say your answer is based only on the rows available rather than implying it covers the entire dataset.
 
 **Context:**
 {context}

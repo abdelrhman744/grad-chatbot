@@ -68,13 +68,18 @@ from reportlab.platypus.tableofcontents import TableOfContents
 
 from config import settings
 from services import storage_service
-from services.llm_provider import get_llm
+from services.llm_provider import get_llm, GroqLLM
 from services.rag_service import detect_language, get_document_pages, retrieve
 from utils.prompt_safety import wrap_untrusted_context
 
 log = logging.getLogger("report_service")
 
 llm = get_llm()
+# Dedicated instance for the combined 4-section REDUCE call
+# (_reduce_narratives) — needs a higher max_tokens than the shared `llm`
+# instance's default (settings.LLM_MAX_TOKENS=800, sized for a single
+# section) since one call now returns all 4 sections' text at once.
+_reduce_llm = GroqLLM(model=settings.GROQ_MODEL, max_tokens=max(1800, settings.LLM_MAX_TOKENS * 2))
 
 MAX_DIGEST_CHARS = 14000  # cap on how much aggregated-fact text feeds each reduce call
 MAP_EXTRACT_CONCURRENCY = 5  # bounded worker pool for the per-slice MAP step
@@ -308,59 +313,74 @@ def _digest(map_results: List[dict]) -> str:
     return text
 
 
-def _reduce_narrative(digest: str, aggregated: dict, filename: str, lang: str, kind: str) -> str:
+_NARRATIVE_KEYS = ("executive_summary", "introduction", "relationships", "conclusion")
+
+
+def _reduce_narratives(digest: str, aggregated: dict, label: str, lang: str) -> dict:
+    """
+    ONE combined LLM call producing all 4 REDUCE-step narrative sections
+    (executive summary, introduction, relationships, conclusion) as a
+    single JSON object — replaces 4 separate calls that shared the same
+    digest/key-points input and only differed in which section they wrote.
+
+    Those 4 calls already ran CONCURRENTLY (a ThreadPoolExecutor, not one
+    at a time), so this isn't primarily a latency fix — it's a token and
+    rate-limit-pressure one: 1 copy of the digest/context sent instead of
+    4, and one call's worth of simultaneous TPM draw on GROQ_MODEL's pool
+    instead of 4 at once (which, under load, is the more likely trigger
+    for a 429 than 4 slightly-slower sequential calls would be).
+
+    Uses `_reduce_llm`, a dedicated instance with a higher max_tokens than
+    the module default (`settings.LLM_MAX_TOKENS`, tuned for a single
+    section) since the combined output is all 4 sections' text plus JSON
+    structure — the default budget risked truncating this.
+
+    Returns a dict with all 4 keys (empty string per key on any failure —
+    never raises), so a malformed response degrades to missing sections
+    rather than failing report generation entirely.
+    """
     facts = "\n".join(f"- {kp}" for kp in aggregated["key_points"][:60])
+    empty = {k: "" for k in _NARRATIVE_KEYS}
 
-    prompts = {
-        "executive_summary": {
-            "ar": f"""بالاعتماد فقط على ملخصات أجزاء المستند "{filename}" أدناه، اكتب ملخصًا تنفيذيًا احترافيًا من 5-7 جمل يغطي الغرض من المستند وأهم ما جاء فيه. لا تخترع أي معلومة غير مذكورة.
-
-ملخصات الأجزاء:
-{digest}""",
-            "en": f"""Based only on the section summaries of document "{filename}" below, write a professional executive summary (5-7 sentences) covering the document's purpose and most important content. Do not invent information not mentioned.
-
-Section summaries:
-{digest}""",
-        },
-        "introduction": {
-            "ar": f"""بالاعتماد فقط على ملخصات أجزاء المستند "{filename}" أدناه، اكتب مقدمة من 3-5 جمل تشرح موضوع المستند ونطاقه والجمهور المستهدف منه إن أمكن استنتاجه.
+    if lang == "ar":
+        prompt = f"""بالاعتماد فقط على ملخصات أجزاء المستند "{label}" والنقاط الرئيسية المستخرجة منه أدناه، اكتب أربعة أقسام نصية احترافية. لا تخترع أي معلومة غير مذكورة فيهما.
 
 ملخصات الأجزاء:
-{digest}""",
-            "en": f"""Based only on the section summaries of document "{filename}" below, write a 3-5 sentence introduction explaining the document's subject, scope, and intended audience if inferable.
-
-Section summaries:
-{digest}""",
-        },
-        "relationships": {
-            "ar": f"""بالاعتماد فقط على النقاط الرئيسية التالية المستخرجة من المستند "{filename}"، اشرح في فقرة أو فقرتين العلاقات والروابط بين أهم المفاهيم الواردة (كيف يرتبط بعضها ببعض، أو يعتمد بعضها على بعض). إذا لم تكن هناك علاقات واضحة بين المفاهيم، اذكر ذلك بإيجاز بدلاً من اختلاق روابط.
+{digest}
 
 النقاط الرئيسية:
-{facts}""",
-            "en": f"""Based only on the following key points extracted from document "{filename}", explain in one or two paragraphs how the main concepts relate to or depend on each other. If no clear relationships exist between the concepts, briefly say so rather than inventing connections.
+{facts}
 
-Key points:
-{facts}""",
-        },
-        "conclusion": {
-            "ar": f"""بالاعتماد فقط على ملخصات الأجزاء التالية من المستند "{filename}"، اكتب خاتمة احترافية من 3-5 جمل تلخص أهم النتائج أو الدروس المستفادة من المستند.
-
-ملخصات الأجزاء:
-{digest}""",
-            "en": f"""Based only on the following section summaries of document "{filename}", write a professional conclusion (3-5 sentences) summarizing the document's key takeaways.
+أعد كائن JSON واحد فقط بهذا الشكل بالضبط (بدون أي نص خارج الـ JSON):
+{{"executive_summary": "ملخص تنفيذي من 5-7 جمل يغطي الغرض من المستند وأهم ما جاء فيه",
+  "introduction": "مقدمة من 3-5 جمل تشرح موضوع المستند ونطاقه والجمهور المستهدف منه إن أمكن استنتاجه",
+  "relationships": "فقرة أو فقرتان تشرحان العلاقات والروابط بين أهم المفاهيم الواردة، بالاعتماد فقط على النقاط الرئيسية أعلاه؛ إذا لم تكن هناك علاقات واضحة، اذكر ذلك بإيجاز بدلاً من اختلاق روابط",
+  "conclusion": "خاتمة من 3-5 جمل تلخص أهم النتائج أو الدروس المستفادة من المستند"}}"""
+    else:
+        prompt = f"""Based only on the section summaries and key points of document "{label}" below, write four professional narrative sections. Do not invent information not mentioned in either.
 
 Section summaries:
-{digest}""",
-        },
-    }
+{digest}
 
-    prompt = prompts[kind]["ar" if lang == "ar" else "en"]
+Key points:
+{facts}
+
+Return ONLY one JSON object in exactly this shape (no text outside the JSON):
+{{"executive_summary": "a 5-7 sentence executive summary covering the document's purpose and most important content",
+  "introduction": "a 3-5 sentence introduction explaining the document's subject, scope, and intended audience if inferable",
+  "relationships": "one or two paragraphs explaining how the main concepts relate to or depend on each other, using only the key points above; if no clear relationships exist, briefly say so rather than inventing connections",
+  "conclusion": "a 3-5 sentence professional conclusion summarizing the document's key takeaways"}}"""
 
     try:
-        return str(llm.invoke(prompt)).strip()
+        raw = str(_reduce_llm.invoke(prompt)).strip()
+        data = _parse_json_object(raw)
+        if not data:
+            log.error("[report] combined reduce step returned unparsable JSON")
+            return empty
+        return {k: str(data.get(k) or "").strip() for k in _NARRATIVE_KEYS}
     except Exception as e:
-        log.error(f"[report] reduce step '{kind}' failed: {e}")
-        return ""
+        log.error(f"[report] combined reduce step failed: {e}")
+        return empty
 
 
 # ── Full pipeline ────────────────────────────────────────────────────────────
@@ -397,18 +417,9 @@ def build_report_data(filename: str) -> dict:
     aggregated = _aggregate(map_results)
     digest = _digest(map_results)
 
-    # The 4 REDUCE narrative sections share the same digest/aggregated
-    # input and only differ by which section they're writing — independent
-    # calls, so run them concurrently too instead of 4 sequential ones.
-    narrative_kinds = ["executive_summary", "introduction", "relationships", "conclusion"]
-    with ThreadPoolExecutor(max_workers=len(narrative_kinds)) as pool:
-        narratives = dict(zip(
-            narrative_kinds,
-            pool.map(
-                lambda kind: _reduce_narrative(digest, aggregated, filename, lang, kind),
-                narrative_kinds,
-            ),
-        ))
+    # All 4 REDUCE narrative sections in one combined call — see
+    # _reduce_narratives's docstring.
+    narratives = _reduce_narratives(digest, aggregated, filename, lang)
 
     return {
         "filename": filename,
@@ -554,15 +565,7 @@ def build_topic_report_data(
     aggregated = _aggregate(map_results)
     digest = _digest(map_results)
 
-    narrative_kinds = ["executive_summary", "introduction", "relationships", "conclusion"]
-    with ThreadPoolExecutor(max_workers=len(narrative_kinds)) as pool:
-        narratives = dict(zip(
-            narrative_kinds,
-            pool.map(
-                lambda kind: _reduce_narrative(digest, aggregated, topic, lang, kind),
-                narrative_kinds,
-            ),
-        ))
+    narratives = _reduce_narratives(digest, aggregated, topic, lang)
 
     return {
         "filename": topic,

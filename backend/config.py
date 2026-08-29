@@ -85,14 +85,30 @@ class Settings:
 
     # ── LLM (Groq) ───────────────────────────────────────────────────────
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    # Answer-generation model. qwen/qwen3.8-27b has its own separate ~8,000
+    # TPM rate-limit pool on Groq — see the speed-optimization report.
+    # Deliberately NOT reused for AGENT_MODEL below (see its comment) so a
+    # multi-call turn's planning steps don't compete with generation for
+    # this same small pool.
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 
     # Model used by the agent's action-selection step. This is a structured
     # JSON routing decision (pick one of a handful of tools), not open-ended
-    # generation, so a smaller/faster model is used by default to cut
-    # per-turn planner latency; override with AGENT_MODEL (e.g. back to
-    # GROQ_MODEL) if routing quality needs the larger model instead.
-    AGENT_MODEL: str = os.getenv("AGENT_MODEL", "llama-3.1-8b-instant")
+    # generation, so a smaller/faster model is used here — separate from
+    # GROQ_MODEL both for speed (a smaller model responds faster) and for
+    # rate-limit isolation (a different Groq model = a different TPM pool,
+    # so the planner's 1-2 calls/turn never draw down GROQ_MODEL's budget).
+    # openai/gpt-oss-20b was chosen over the originally-considered
+    # llama-3.1-8b-instant: as of this change, llama-3.1-8b-instant is NOT
+    # in this account's available Groq model list (verified via a live
+    # `client.models.list()` call) — it appears to have been retired.
+    # openai/gpt-oss-safeguard-20b (this repo's OLD AGENT_MODEL default) was
+    # already empirically verified in this exact planner role during the
+    # token-consumption audit (10/10 routing checks passed, sub-1s calls);
+    # the plain (non-safeguard) 20b variant used here is the same size/speed
+    # class without the safety-classifier fine-tune's domain mismatch for
+    # general ReAct routing.
+    AGENT_MODEL: str = os.getenv("AGENT_MODEL", "openai/gpt-oss-20b")
 
     # Every JSON-mode model occasionally has Groq's own server-side JSON
     # validator reject a request outright (400 json_validate_failed /
@@ -105,8 +121,11 @@ class Settings:
     # safe rather than masking a real problem. Deliberately a distinct
     # model from AGENT_MODEL (see agent/llm.py's AgentLLM) so a systemic
     # issue with the primary model's pool (rate limit, outage) doesn't take
-    # the fallback down with it.
-    AGENT_FALLBACK_MODEL: str = os.getenv("AGENT_FALLBACK_MODEL", "qwen/qwen3.8-27b")
+    # the fallback down with it — must never equal AGENT_MODEL or GROQ_MODEL.
+    # openai/gpt-oss-safeguard-20b: same "openai/gpt-oss" family as
+    # AGENT_MODEL (so still fast) but a genuinely different checkpoint/pool,
+    # and already verified live in this codebase's planner role.
+    AGENT_FALLBACK_MODEL: str = os.getenv("AGENT_FALLBACK_MODEL", "openai/gpt-oss-safeguard-20b")
 
     LLM_TEMPERATURE: float = _float("LLM_TEMPERATURE", 0.0)
     LLM_MAX_TOKENS: int = _int("LLM_MAX_TOKENS", 800)
@@ -219,7 +238,7 @@ class Settings:
     # extra retrieval variants, on top of the existing translation/typo-fix/
     # rephrase variants. Helps semantic/evaluative questions ("which is more
     # efficient?", "pros and cons?") match document wording that doesn't share
-    # the user's exact vocabulary. See _rewrite_query() / _query_variants().
+    # the user's exact vocabulary. See _rewrite_and_translate() / _query_variants().
     QUERY_EXPANSION_ENABLED: bool = _bool("QUERY_EXPANSION_ENABLED", True)
 
     # Chunking strategy: "recursive" (default, unchanged behavior — fixed

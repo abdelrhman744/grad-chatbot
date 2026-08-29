@@ -417,8 +417,9 @@ Nothing is hardcoded in source — every key below is read via `config.py`.
 | Variable          | Default                      | Description                                                        |
 |--------------------|-------------------------------|----------------------------------------------------------------------|
 | `GROQ_API_KEY`      | *(required)*                 | Your Groq API key. Get one at https://console.groq.com/keys        |
-| `GROQ_MODEL`        | `llama-3.3-70b-versatile`    | Model used for answer generation, translation, summarization, etc. |
-| `AGENT_MODEL`       | same as `GROQ_MODEL`         | Model used for the agent's action-selection (planning) step.       |
+| `GROQ_MODEL`        | `qwen/qwen3.8-27b`           | Model used for final answer generation, summarization, comparison, and topic-report reduction. |
+| `AGENT_MODEL`       | `openai/gpt-oss-20b`         | Small/fast model for the agent's action-selection (planning) step and query rewrite/translation — deliberately a different, smaller model on a separate Groq rate-limit pool from `GROQ_MODEL`. |
+| `AGENT_FALLBACK_MODEL` | `openai/gpt-oss-safeguard-20b` | Distinct-model retry target when Groq's JSON validator rejects an `AGENT_MODEL` request outright — must stay different from both `AGENT_MODEL` and `GROQ_MODEL`. |
 | `LLM_TEMPERATURE`   | `0.0`                        | Sampling temperature.                                              |
 | `LLM_MAX_TOKENS`    | `800`                        | Max tokens per generation.                                         |
 | `LLM_TOP_P`         | `0.90`                       | Nucleus sampling parameter.                                        |

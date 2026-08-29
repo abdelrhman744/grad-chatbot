@@ -49,7 +49,8 @@ log = logging.getLogger("agent")
 # farewell, or a question about the conversation itself. Used by
 # `Agent._correct_premature_terminal` below instead of re-asking the LLM —
 # see that method's docstring for why the second Groq round-trip was
-# removed.
+# removed — AND by the pre-planner fast path below (`_classify_fast_path`)
+# to skip the planner call entirely for this same class of message.
 #
 # Matching is a whole-message, word-count-gated phrase lookup (not a
 # "starts with" or "contains" check): a message longer than
@@ -58,44 +59,123 @@ log = logging.getLogger("agent")
 # "retrieve" — only genuinely short, pure small-talk messages are trusted.
 _SMALL_TALK_MAX_WORDS = 6
 
-_SMALL_TALK_PHRASES = {
-    # English greetings / thanks / farewells / filler acknowledgements
-    "hi", "hello", "hi there", "hello there", "hey", "hey there", "yo", "sup",
-    "good morning", "good afternoon", "good evening", "good night",
-    "how are you", "hows it going", "how's it going", "what's up", "whats up",
-    "thanks", "thank you", "thanks a lot", "thank you so much", "thx", "ty",
-    "appreciate it", "much appreciated",
-    "bye", "goodbye", "see you", "see you later", "take care", "good night",
-    "ok", "okay", "cool", "great", "nice", "got it", "sounds good", "awesome",
-    "who are you", "what can you do", "what is your name", "whats your name",
+# Pure greeting/thanks/farewell/acknowledgement/identity phrases have a
+# fixed, correct answer that doesn't depend on conversation content at
+# all — these get a CANNED response with NO Groq call whatsoever (see
+# `_classify_fast_path`). Split by category only so each gets a
+# category-appropriate canned reply; the categories carry no other meaning.
+_CANNED_PHRASES: dict[str, set[str]] = {
+    "greeting": {
+        "hi", "hello", "hi there", "hello there", "hey", "hey there", "yo", "sup",
+        "good morning", "good afternoon", "good evening", "good night",
+        "how are you", "hows it going", "how's it going", "what's up", "whats up",
+        "مرحبا", "اهلا", "أهلا", "هاي", "السلام عليكم",
+        "صباح الخير", "مساء الخير",
+        "ازيك", "عامل ايه", "عاملة ايه", "كيف حالك", "كيفك",
+    },
+    "thanks": {
+        "thanks", "thank you", "thanks a lot", "thank you so much", "thx", "ty",
+        "appreciate it", "much appreciated",
+        "شكرا", "متشكر", "متشكرة", "يسلمو", "تسلم", "تسلمي", "الله يسلمك",
+    },
+    "farewell": {
+        "bye", "goodbye", "see you", "see you later", "take care",
+        "باي", "مع السلامة", "تصبح على خير",
+    },
+    "ack": {
+        "ok", "okay", "cool", "great", "nice", "got it", "sounds good", "awesome",
+        "تمام", "حلو", "كويس", "اوك", "ماشي",
+    },
+    "identity": {
+        "who are you", "what can you do", "what is your name", "whats your name",
+        "مين انت", "اسمك ايه", "تقدر تعمل ايه",
+    },
+}
+
+# Meta-conversation questions genuinely need the conversation's own memory
+# content to answer correctly ("what did I just ask?") — these still skip
+# the PLANNER call (they're unambiguously small talk, never document
+# lookup), but still need one real generation call over memory text. See
+# `_classify_fast_path`.
+_MEMORY_SMALL_TALK_PHRASES = {
     "what did i ask", "what did i ask you", "what did i just ask",
     "what did i ask before", "what did i ask you before",
     "what did you say", "can you repeat that", "can you repeat",
-    # Arabic equivalents
-    "مرحبا", "اهلا", "أهلا", "هاي", "السلام عليكم",
-    "صباح الخير", "مساء الخير",
-    "ازيك", "عامل ايه", "عاملة ايه", "كيف حالك", "كيفك",
-    "شكرا", "متشكر", "متشكرة", "يسلمو", "تسلم", "تسلمي", "الله يسلمك",
-    "باي", "مع السلامة", "تصبح على خير",
-    "تمام", "حلو", "كويس", "اوك", "ماشي",
-    "مين انت", "اسمك ايه", "تقدر تعمل ايه",
     "ايه اللي سألتك", "قولتلك ايه", "تقدر تعيد",
 }
 
+_SMALL_TALK_PHRASES = frozenset(
+    {p for phrases in _CANNED_PHRASES.values() for p in phrases} | _MEMORY_SMALL_TALK_PHRASES
+)
 
-def _looks_like_small_talk(question: str) -> bool:
-    """No-LLM-call check: strip trailing punctuation/whitespace, collapse
-    internal whitespace, lowercase, and look up the whole normalized
-    message in `_SMALL_TALK_PHRASES` — but only if it's short enough
+# One fixed reply per canned category (EN/AR) — used verbatim, no LLM call.
+_CANNED_RESPONSES: dict[str, dict[str, str]] = {
+    "greeting": {
+        "en": "Hello! How can I help you with your documents today?",
+        "ar": "أهلاً بك! إزاي أقدر أساعدك في مستنداتك النهاردة؟",
+    },
+    "thanks": {
+        "en": "You're welcome! Let me know if there's anything else you'd like to explore in your documents.",
+        "ar": "العفو! قوللي لو حابب تستكشف حاجة تانية في مستنداتك.",
+    },
+    "farewell": {
+        "en": "Goodbye! Feel free to come back anytime you have questions about your documents.",
+        "ar": "مع السلامة! ارجعلي في أي وقت لو كان عندك أسئلة عن مستنداتك.",
+    },
+    "ack": {
+        "en": "Got it! Let me know if you have any questions about your documents.",
+        "ar": "تمام! قوللي لو عندك أي سؤال عن مستنداتك.",
+    },
+    "identity": {
+        "en": "I'm an AI assistant that answers questions strictly from the documents you've uploaded — ask me anything about their content.",
+        "ar": "أنا مساعد ذكاء اصطناعي بجاوب على الأسئلة بالاعتماد فقط على المستندات اللي رفعتها — اسألني عن أي حاجة فيها.",
+    },
+}
+
+
+def _normalize_small_talk(question: str) -> str:
+    """Strip trailing punctuation/whitespace, collapse internal whitespace,
+    lowercase. Returns "" if the message is empty or too long
     (`_SMALL_TALK_MAX_WORDS`) to plausibly be pure small talk at all."""
     text = (question or "").strip()
     if not text:
-        return False
+        return ""
     stripped = re.sub(r"[\s!.,?؟،]+$", "", text).strip()
     if not stripped or len(stripped.split()) > _SMALL_TALK_MAX_WORDS:
-        return False
-    normalized = re.sub(r"\s+", " ", stripped).strip().lower()
-    return normalized in _SMALL_TALK_PHRASES
+        return ""
+    return re.sub(r"\s+", " ", stripped).strip().lower()
+
+
+def _looks_like_small_talk(question: str) -> bool:
+    """No-LLM-call check: does the whole normalized message match any known
+    small-talk phrase (canned or memory-based)? Used by
+    `_correct_premature_terminal` to decide whether the planner's own
+    "respond" choice should be trusted as-is."""
+    normalized = _normalize_small_talk(question)
+    return bool(normalized) and normalized in _SMALL_TALK_PHRASES
+
+
+def _classify_fast_path(question: str) -> tuple[str, str] | None:
+    """
+    Zero-LLM-call classification for the pre-planner fast path (see
+    `Agent._run_impl`/`_run_stream_impl`): returns `("canned", category)` if
+    `question` is a pure greeting/thanks/farewell/ack/identity message (no
+    Groq call needed at all — see `_CANNED_RESPONSES`), `("memory", "")` if
+    it's a meta-conversation question needing real memory content, or
+    `None` if it needs the normal planner loop. This is strictly a SUBSET
+    of what `_looks_like_small_talk` matches — every fast-path hit is also
+    small talk `_correct_premature_terminal` would trust, so this can never
+    fast-path a message the planner would have routed to retrieval.
+    """
+    normalized = _normalize_small_talk(question)
+    if not normalized:
+        return None
+    for category, phrases in _CANNED_PHRASES.items():
+        if normalized in phrases:
+            return ("canned", category)
+    if normalized in _MEMORY_SMALL_TALK_PHRASES:
+        return ("memory", "")
+    return None
 
 
 class Agent:
@@ -197,6 +277,11 @@ class Agent:
             detected_lang = detect_language(question) if language == "auto" else language
         context = ExecutionContext(language=detected_lang)
 
+        fast_result = self._fast_path_answer(question, context)
+        if fast_result is not None:
+            self._remember(question, fast_result)
+            return fast_result
+
         for iteration in range(self.max_iterations):
             messages = self._build_messages(question, context)
             with timing.stage("agent_planning"):
@@ -264,76 +349,98 @@ class Agent:
         context = ExecutionContext(language=detected_lang)
         full_text = ""
 
-        for iteration in range(self.max_iterations):
-            messages = self._build_messages(question, context)
-            with timing.stage("agent_planning"):
-                action = self.llm.invoke(messages, fallback_question=question)
-                action = self._correct_premature_terminal(messages, action, context, question)
+        # Zero/one-call deterministic short-circuit for pure small talk —
+        # see `_classify_fast_path` / `_fast_path_answer`'s docstring
+        # (non-streaming counterpart). Skips the planner loop entirely.
+        fast_classification = _classify_fast_path(question)
 
-            if settings.AGENT_DEBUG:
-                self._debug_step(iteration + 1, action)
+        if fast_classification is not None:
+            kind, category = fast_classification
+            context.observations.append({
+                "tool": "respond", "status": "fast_path", "category": category or "memory",
+            })
+            if kind == "canned":
+                full_text = _CANNED_RESPONSES[category]["ar" if detected_lang == "ar" else "en"]
+                yield {"type": "token", "text": full_text}
+            else:
+                with timing.stage("memory_loading"):
+                    memory_text = self.memory_manager.as_prompt_text()
+                with timing.stage("llm_generation"):
+                    for piece in rag_service.answer_from_memory_stream(question, memory_text, lang=detected_lang):
+                        full_text += piece
+                        yield {"type": "token", "text": piece}
+            context.answer = full_text.strip()
+        else:
+            for iteration in range(self.max_iterations):
+                messages = self._build_messages(question, context)
+                with timing.stage("agent_planning"):
+                    action = self.llm.invoke(messages, fallback_question=question)
+                    action = self._correct_premature_terminal(messages, action, context, question)
 
-            if action.action == ToolName.RETRIEVE:
-                current_question = action.arguments.question.strip().lower()
-                previous_questions = [q.lower() for q in context.retrieved_questions]
+                if settings.AGENT_DEBUG:
+                    self._debug_step(iteration + 1, action)
 
-                if current_question in previous_questions:
-                    context.observations.append({
-                        "tool": "retrieve",
-                        "question": action.arguments.question,
-                        "status": "already_retrieved",
-                    })
+                if action.action == ToolName.RETRIEVE:
+                    current_question = action.arguments.question.strip().lower()
+                    previous_questions = [q.lower() for q in context.retrieved_questions]
+
+                    if current_question in previous_questions:
+                        context.observations.append({
+                            "tool": "retrieve",
+                            "question": action.arguments.question,
+                            "status": "already_retrieved",
+                        })
+                        continue
+
+                    context = self._run_tool(action, context, question)
+                    context.retrieved_questions.append(action.arguments.question)
+                    self._update_active_document_from_retrieval(context)
                     continue
 
+                if action.action in TERMINAL_TOOLS:
+                    if action.action == ToolName.REPORT:
+                        # Report generation is a slow, multi-step pipeline
+                        # (re-read the document, map-reduce with the LLM,
+                        # render the PDF) — there's no meaningful token
+                        # stream for it, so emit a status update instead and
+                        # run it to completion on this same worker thread.
+                        yield {
+                            "type": "status",
+                            "text": (
+                                "جاري تجهيز التقرير، ده ممكن ياخد شوية وقت..."
+                                if detected_lang == "ar"
+                                else "Generating the report — this may take a moment..."
+                            ),
+                        }
+                        context = self._run_tool(action, context, question)
+                        full_text = context.answer or ""
+                    else:
+                        # Wraps the full token-by-token generation, same stage
+                        # name/semantics as generate_answer()'s
+                        # timing.stage("llm_generation") on the non-streaming
+                        # path (rag_service.py) — measures end-to-end LLM
+                        # completion time here since there is no single
+                        # invoke() call to wrap around a streaming generator.
+                        with timing.stage("llm_generation"):
+                            for piece in self._stream_terminal_action(action, context):
+                                full_text += piece
+                                yield {"type": "token", "text": piece}
+                        self._finalize_stream(action, context, full_text)
+                    break
+
                 context = self._run_tool(action, context, question)
-                context.retrieved_questions.append(action.arguments.question)
-                self._update_active_document_from_retrieval(context)
-                continue
-
-            if action.action in TERMINAL_TOOLS:
-                if action.action == ToolName.REPORT:
-                    # Report generation is a slow, multi-step pipeline
-                    # (re-read the document, map-reduce with the LLM,
-                    # render the PDF) — there's no meaningful token
-                    # stream for it, so emit a status update instead and
-                    # run it to completion on this same worker thread.
-                    yield {
-                        "type": "status",
-                        "text": (
-                            "جاري تجهيز التقرير، ده ممكن ياخد شوية وقت..."
-                            if detected_lang == "ar"
-                            else "Generating the report — this may take a moment..."
-                        ),
-                    }
-                    context = self._run_tool(action, context, question)
-                    full_text = context.answer or ""
-                else:
-                    # Wraps the full token-by-token generation, same stage
-                    # name/semantics as generate_answer()'s
-                    # timing.stage("llm_generation") on the non-streaming
-                    # path (rag_service.py) — measures end-to-end LLM
-                    # completion time here since there is no single
-                    # invoke() call to wrap around a streaming generator.
-                    with timing.stage("llm_generation"):
-                        for piece in self._stream_terminal_action(action, context):
-                            full_text += piece
-                            yield {"type": "token", "text": piece}
-                    self._finalize_stream(action, context, full_text)
-                break
-
-            context = self._run_tool(action, context, question)
-        else:
-            # Exhausted max_iterations — force a streamed final answer from
-            # whatever context we have so the user always gets a response.
-            log.warning(f"Agent hit max_iterations ({self.max_iterations}) without finishing.")
-            memory_text = self.memory_manager.as_prompt_text()
-            with timing.stage("llm_generation"):
-                for piece in rag_service.generate_answer_stream(
-                    question, context.documents, lang=context.language, memory=memory_text
-                ):
-                    full_text += piece
-                    yield {"type": "token", "text": piece}
-            context.answer = full_text.strip()
+            else:
+                # Exhausted max_iterations — force a streamed final answer from
+                # whatever context we have so the user always gets a response.
+                log.warning(f"Agent hit max_iterations ({self.max_iterations}) without finishing.")
+                memory_text = self.memory_manager.as_prompt_text()
+                with timing.stage("llm_generation"):
+                    for piece in rag_service.generate_answer_stream(
+                        question, context.documents, lang=context.language, memory=memory_text
+                    ):
+                        full_text += piece
+                        yield {"type": "token", "text": piece}
+                context.answer = full_text.strip()
 
         self._remember(question, context)
 
@@ -398,6 +505,42 @@ class Agent:
         context.observations.append({"tool": action.action.value, "status": "streamed"})
 
     # ── Internal ─────────────────────────────────────────────────────────
+
+    def _fast_path_answer(self, question: str, context: ExecutionContext) -> ExecutionContext | None:
+        """
+        Zero/one-call deterministic short-circuit for pure small talk (see
+        `_classify_fast_path`) — used by the non-streaming `_run_impl`
+        before the planner loop starts. Returns a finished
+        `ExecutionContext` (the planner/generation loop is skipped
+        entirely) if `question` matches, else `None` so the caller falls
+        through to the normal ReAct loop completely unchanged.
+
+        A "canned" match costs ZERO Groq calls (a fixed localized reply).
+        A "memory" match still needs one real generation call over actual
+        conversation content ("what did I just ask?"), but skips the
+        planner call that would otherwise precede it — the planner would
+        deterministically be forced to "respond" here anyway (see
+        `_correct_premature_terminal`), so skipping straight to it changes
+        no behavior, only latency/token cost.
+        """
+        classification = _classify_fast_path(question)
+        if classification is None:
+            return None
+
+        kind, category = classification
+        context.observations.append({
+            "tool": "respond", "status": "fast_path", "category": category or "memory",
+        })
+
+        if kind == "canned":
+            context.answer = _CANNED_RESPONSES[category]["ar" if context.language == "ar" else "en"]
+        else:
+            with timing.stage("memory_loading"):
+                memory_text = self.memory_manager.as_prompt_text()
+            with timing.stage("llm_generation"):
+                context.answer = rag_service.answer_from_memory(question, memory_text, lang=context.language)
+
+        return context
 
     def _build_messages(self, question: str, context: ExecutionContext) -> list[dict]:
         with timing.stage("memory_loading"):
