@@ -375,7 +375,13 @@ services from `docker-compose.yml` (or just don't start them).
 
 - Python 3.10+
 - Node.js 18+
-- `ffmpeg` and `tesseract` on your PATH (for voice input and OCR)
+- `ffmpeg` and `tesseract` on your PATH (for voice input and OCR) — **make
+  sure Arabic language data (`ara`) is installed alongside the default
+  English data**, or Arabic OCR will silently return empty text. On
+  Windows (UB-Mannheim installer), tick "Arabic" under "Additional language
+  data" during setup; on Debian/Ubuntu, `apt-get install tesseract-ocr
+  tesseract-ocr-ara`; on macOS, `brew install tesseract tesseract-lang`.
+  Verify with `tesseract --list-langs` — `ara` must be in the list.
 - A locally-running Qdrant server (`docker run -p 6333:6333 -p 6334:6334
   qdrant/qdrant:v1.19.0`, or any Qdrant instance reachable at `QDRANT_URL`)
 - A [Groq API key](https://console.groq.com/keys) (free tier available)
@@ -664,6 +670,13 @@ Ensure `ffmpeg` and `tesseract` are installed and on your PATH, or set
 these are already installed in the backend image and set via
 `docker-compose.yml`'s `environment:` block — this only applies to native
 (non-Docker) setups.
+
+**Arabic OCR returns empty text (printed/scanned documents)**
+Tesseract's Arabic language data (`ara`) is a separate package from the
+base install and is easy to miss — see the Prerequisites note above.
+`tesseract --list-langs` must include `ara`; if it only shows `eng`/`osd`,
+install the Arabic language pack. The Docker image installs this
+automatically (`tesseract-ocr-ara` in `backend/Dockerfile`).
 
 **CORS errors when calling the backend directly (bypassing the Next.js
 proxy)**

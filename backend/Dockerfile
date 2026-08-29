@@ -30,12 +30,21 @@ FROM python:3.11.10-slim-bookworm AS runtime
 
 # ffmpeg          - audio ingestion (Whisper STT)
 # tesseract-ocr   - OCR fallback for scanned PDFs/images
+# tesseract-ocr-ara - Arabic traineddata for tesseract-ocr. The base
+#                   tesseract-ocr package on Debian only depends on
+#                   tesseract-ocr-eng + tesseract-ocr-osd — Arabic is a
+#                   separate package and is NOT pulled in automatically.
+#                   Without this, every `-l ara+eng` call in
+#                   services/ocr_service.py silently returns an empty
+#                   string for Arabic content (verified directly — see
+#                   the OCR investigation notes / evaluate_printed_ocr_arabic.py).
 # poppler-utils   - pdf2image (PDF -> image rasterization for OCR)
 # libgl1/libglib2.0-0 - required by opencv-python at import time
 # curl            - used by the HEALTHCHECK below
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tesseract-ocr \
+    tesseract-ocr-ara \
     poppler-utils \
     libgl1 \
     libglib2.0-0 \
