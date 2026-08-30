@@ -96,7 +96,10 @@ services:
       - backend_model_cache:/root/.cache
       # Runtime state that predates this migration; bind-mounted so it
       # survives container rebuilds same as it survived local restarts.
+<<<<<<< HEAD
       - ./backend/memory_storage:/app/memory_storage
+=======
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
       - ./backend/processed_files.json:/app/processed_files.json
     depends_on:
       qdrant:

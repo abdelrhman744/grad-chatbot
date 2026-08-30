@@ -1,6 +1,7 @@
 """
 memory_manager.py
 
+<<<<<<< HEAD
 Coordinates:
 - Short-term memory (recent raw messages, in RAM)
 - Long-term memory (a capped, deduplicated store of discrete facts,
@@ -11,10 +12,34 @@ This is the memory system the Agent talks to. It never talks to the LLM
 provider, Qdrant, or the RAG pipeline directly — it only depends on an injected
 `.generate(prompt) -> str` LLM adapter, which keeps memory fully reusable
 outside the agent context (e.g. for automated tests).
+=======
+Conversational memory, short-term only: the recent raw messages of a
+conversation, kept in RAM.
+
+Long-term memory (LLM-based fact extraction + disk-persisted FactStore,
+see the removed memory/fact_extractor.py and memory/summary_memory.py)
+was removed. It added, per conversation, roughly every
+MEMORY_MAX_MESSAGES messages:
+  - an extra Groq call (fact extraction) on a background thread,
+  - an uncapped `threading.Thread(...).start()` per event -- on a small
+    box under concurrent load (many conversations crossing the threshold
+    around the same time) this is unbounded thread/stack growth, not a
+    fixed cost,
+  - a non-atomic JSON file write per conversation (corruption risk on a
+    crash/restart mid-write).
+For a session-scoped assistant where conversations rarely outlive
+agent/session.py's idle eviction window, that cost bought little: a new
+Agent's ShortMemory starts empty on reload either way now, exactly as if
+the conversation were new. Dropping it removes all three costs above.
+
+This is the memory system the Agent talks to. It has no dependency on an
+LLM, on disk, or on a background thread pool.
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 """
 
 from __future__ import annotations
 
+<<<<<<< HEAD
 import logging
 import threading
 
@@ -24,21 +49,32 @@ from memory.short_memory import ShortMemory
 from memory.summary_memory import FactStore, SummaryMemory
 
 log = logging.getLogger("memory_manager")
+=======
+from config import settings
+from memory.short_memory import ShortMemory
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 
 
 class MemoryManager:
     def __init__(
         self,
+<<<<<<< HEAD
         llm,
+=======
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
         conversation_id: str = settings.DEFAULT_CONVERSATION_ID,
         max_messages: int = settings.MEMORY_MAX_MESSAGES,
         keep_recent: int = settings.MEMORY_KEEP_RECENT,
     ):
+<<<<<<< HEAD
         self.llm = llm
+=======
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
         self.conversation_id = conversation_id
         self.keep_recent = keep_recent
 
         self.short_memory = ShortMemory(max_messages, max_chars=settings.MEMORY_MAX_CHARS)
+<<<<<<< HEAD
         self._persistence = SummaryMemory()
 
         # Load persisted facts once when the conversation starts.
@@ -52,11 +88,26 @@ class MemoryManager:
         buffer exceeds its limit (by message count or character budget),
         automatically fold it into the long-term fact store and trim it
         back down.
+=======
+
+    # -- Public API ----------------------------------------------------------
+
+    def add_message(self, role: str, content: str) -> None:
+        """
+        Add a single message to short-term memory. If the buffer exceeds
+        its limit (by message count or character budget), trim it back
+        down to the most recent `keep_recent` messages -- purely in
+        memory, no LLM call, no disk write.
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
         """
         self.short_memory.add_message(role, content)
 
         if self.short_memory.should_summarize():
+<<<<<<< HEAD
             self._summarize_async()
+=======
+            self.short_memory.keep_last(self.keep_recent)
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 
     def add_turn(self, user_message: str, assistant_message: str) -> None:
         """Add one complete User -> Assistant turn."""
@@ -66,6 +117,7 @@ class MemoryManager:
     def get_recent_messages(self) -> list[dict]:
         return self.short_memory.get_messages()
 
+<<<<<<< HEAD
     def get_summary(self) -> str:
         """Long-term memory, rendered as text (kept for backward
         compatibility — this previously returned the free-text summary
@@ -138,3 +190,26 @@ class MemoryManager:
                 log.warning(f"Background memory summarization failed: {e}")
 
         threading.Thread(target=_run, daemon=True).start()
+=======
+    def get_context(self) -> dict:
+        """Memory context, handed to the agent / generation prompts."""
+        return {"messages": self.get_recent_messages()}
+
+    def as_prompt_text(self, window: int = settings.MEMORY_WINDOW) -> str:
+        """
+        Render the most recent `window` raw messages as plain text
+        suitable for injecting into an LLM prompt.
+        """
+        recent = self.short_memory.get_messages()[-window:]
+        if not recent:
+            return ""
+
+        formatted = "\n".join(
+            f"{m['role'].capitalize()}: {m['content']}" for m in recent
+        )
+        return f"Recent messages:\n{formatted}"
+
+    def reset(self) -> None:
+        """Clear short-term memory."""
+        self.short_memory.clear()
+>>>>>>> aac0288 (Initial commit - LASTVERSION)

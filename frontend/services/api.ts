@@ -53,6 +53,25 @@ export interface ReportResponse {
 }
 
 /**
+<<<<<<< HEAD
+=======
+ * Thrown only when fetch() itself never got an HTTP response at all — DNS
+ * failure, connection refused, or (notably on Windows/Docker Desktop's
+ * WSL2 networking) a transient net::ERR_CONNECTION_RESET on the
+ * host<->container port-forward. This is distinct from a real HTTP error
+ * status (server responded, just not with 2xx) and from the AbortController
+ * timeout below — both of those indicate an actual problem worth surfacing
+ * immediately, whereas this one is often gone on the very next attempt.
+ */
+class NetworkError extends Error {
+  constructor(path: string, cause: unknown) {
+    super(`Network error while calling ${path}: ${(cause as any)?.message || cause}`);
+    this.name = "NetworkError";
+  }
+}
+
+/**
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
  * Fetch wrapper that:
  *  - applies a client-side timeout (AbortController) so a stalled request
  *    fails fast with a clear message instead of hanging forever.
@@ -83,7 +102,11 @@ async function apiFetch(
     // fetch() only throws for network-level failures (DNS, connection
     // refused, CORS, etc.) — i.e. the request never got an HTTP response
     // at all. Surface that distinctly from an HTTP error status.
+<<<<<<< HEAD
     throw new Error(`Network error while calling ${path}: ${err?.message || err}`);
+=======
+    throw new NetworkError(path, err);
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
   } finally {
     clearTimeout(timeout);
   }
@@ -170,9 +193,38 @@ async function startUploadJob(files: File[], conversationId: string): Promise<{ 
   return res.json();
 }
 
+<<<<<<< HEAD
 async function getUploadJobStatus(jobId: string): Promise<UploadJobStatus> {
   const res = await apiFetch(`/upload/status/${jobId}`);
   return res.json();
+=======
+// A single poll occasionally fails with a transient network-layer reset
+// before it ever reaches the backend — most commonly net::ERR_CONNECTION_RESET
+// on Windows/Docker Desktop's WSL2 host<->container port-forward — even
+// though the backend job is running fine and the very next poll a moment
+// later succeeds. Retry just that case a few times within this single poll
+// iteration (not bypassing uploadFiles()'s overall UPLOAD_POLL_TIMEOUT_MS
+// deadline) before letting it propagate as a real error. A real HTTP error
+// status or the AbortController timeout is NOT retried here — those mean
+// the request did get through and something is actually wrong.
+const STATUS_POLL_RETRY_DELAYS_MS = [500, 1000, 1500];
+
+async function getUploadJobStatus(jobId: string): Promise<UploadJobStatus> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await apiFetch(`/upload/status/${jobId}`);
+      return res.json();
+    } catch (err) {
+      const isLastAttempt = attempt >= STATUS_POLL_RETRY_DELAYS_MS.length;
+      if (!(err instanceof NetworkError) || isLastAttempt) {
+        throw err;
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, STATUS_POLL_RETRY_DELAYS_MS[attempt])
+      );
+    }
+  }
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 }
 
 /**
@@ -362,4 +414,8 @@ export function streamChat(
     settled = true;
     socket.close();
   };
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> aac0288 (Initial commit - LASTVERSION)

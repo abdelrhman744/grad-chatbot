@@ -2,10 +2,18 @@
 session.py
 
 Keeps one Agent instance per conversation_id alive across requests, so
+<<<<<<< HEAD
 short-term memory (and the loaded long-term summary) persists between
 turns without re-reading disk every time. This is an in-process registry;
 it resets when the backend restarts (the persisted long-term summary on
 disk survives restarts regardless).
+=======
+short-term memory persists between turns without being rebuilt from
+scratch on every request. This is an in-process registry; it resets when
+the backend restarts — conversational memory is short-term/in-RAM only
+(see memory/memory_manager.py), so a restart clears it the same way idle
+eviction below does.
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 
 Idle-Agent cleanup
 ------------------
@@ -19,11 +27,18 @@ registry and evicts entries that are both idle (no activity for
 `AGENT_IDLE_TIMEOUT_SECONDS`) AND not currently handling a request
 (`Agent.is_idle()` — see agent/agent.py, which tracks its own in-flight
 count so a slow request can never be evicted out from under itself). This
+<<<<<<< HEAD
 only frees RAM: it does not touch the persisted
 `memory_storage/<conversation_id>.json` fact store, and a later request
 for the same conversation_id transparently creates a fresh Agent (empty
 short-term memory, but its long-term facts are reloaded from disk exactly
 as they would be on a cold start today — see MemoryManager.__init__).
+=======
+only frees RAM. Conversational memory is short-term only (see
+memory/memory_manager.py) — there is no persisted long-term store, so a
+later request for the same conversation_id transparently creates a fresh
+Agent with empty memory, exactly as it would on a cold start.
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 """
 
 from __future__ import annotations

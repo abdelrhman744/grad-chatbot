@@ -13,8 +13,11 @@ default.
 from __future__ import annotations
 
 import os
+<<<<<<< HEAD
 import secrets
 import sys
+=======
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -47,6 +50,7 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+<<<<<<< HEAD
 def _secret_key() -> str:
     val = os.getenv("APP_SECRET_KEY", "").strip()
     if val:
@@ -75,6 +79,9 @@ class Settings:
     # is left unset.
     APP_SECRET_KEY: str = _secret_key()
 
+=======
+class Settings:
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
     # ── CORS ─────────────────────────────────────────────────────────────
     # Comma-separated allowlist of origins permitted to call the API with
     # credentials. Wildcard ("*") is intentionally not supported here: it
@@ -85,6 +92,7 @@ class Settings:
 
     # ── LLM (Groq) ───────────────────────────────────────────────────────
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+<<<<<<< HEAD
     # Answer-generation model. qwen/qwen3.8-27b has its own separate ~8,000
     # TPM rate-limit pool on Groq — see the speed-optimization report.
     # Deliberately NOT reused for AGENT_MODEL below (see its comment) so a
@@ -126,10 +134,21 @@ class Settings:
     # AGENT_MODEL (so still fast) but a genuinely different checkpoint/pool,
     # and already verified live in this codebase's planner role.
     AGENT_FALLBACK_MODEL: str = os.getenv("AGENT_FALLBACK_MODEL", "openai/gpt-oss-safeguard-20b")
+=======
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    # Model used by the agent's action-selection step. This is a structured
+    # JSON routing decision (pick one of a handful of tools), not open-ended
+    # generation, so a smaller/faster model is used by default to cut
+    # per-turn planner latency; override with AGENT_MODEL (e.g. back to
+    # GROQ_MODEL) if routing quality needs the larger model instead.
+    AGENT_MODEL: str = os.getenv("AGENT_MODEL", "llama-3.1-8b-instant")
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 
     LLM_TEMPERATURE: float = _float("LLM_TEMPERATURE", 0.0)
     LLM_MAX_TOKENS: int = _int("LLM_MAX_TOKENS", 800)
     LLM_TOP_P: float = _float("LLM_TOP_P", 0.90)
+<<<<<<< HEAD
 
     # The Groq SDK retries a failed request (rate limits, transient 5xx)
     # internally, honoring the API's own Retry-After hint, before raising.
@@ -145,6 +164,13 @@ class Settings:
     GROQ_MAX_RETRIES: int = _int("GROQ_MAX_RETRIES", 2)
     # Hard per-call ceiling so a single Groq request can never hang
     # indefinitely regardless of retry configuration.
+=======
+    # Passed straight to the Groq SDK client (see
+    # services/llm_provider.py::_get_client) so the worst-case wall-clock
+    # cost of a single Groq call under rate-limiting/transient errors is a
+    # known, tunable quantity instead of the SDK's internal default.
+    GROQ_MAX_RETRIES: int = _int("GROQ_MAX_RETRIES", 2)
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
     GROQ_REQUEST_TIMEOUT_SECONDS: float = _float("GROQ_REQUEST_TIMEOUT_SECONDS", 30.0)
 
     # ── Embeddings ───────────────────────────────────────────────────────
@@ -199,7 +225,11 @@ class Settings:
     # cases. The real grounding guard is the LLM prompt rule in
     # build_prompt() that refuses to answer unless the context specifically
     # covers the question.
+<<<<<<< HEAD
     CONFIDENCE_THRESHOLD: float = _float("CONFIDENCE_THRESHOLD", 0.05)
+=======
+    CONFIDENCE_THRESHOLD: float = _float("CONFIDENCE_THRESHOLD", 0.5)
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 
     # ── Reranking (cross-encoder + lexical blend, diversity, context budget) ──
     # Cross-encoder reranking blends a semantic relevance score (a small
@@ -238,7 +268,11 @@ class Settings:
     # extra retrieval variants, on top of the existing translation/typo-fix/
     # rephrase variants. Helps semantic/evaluative questions ("which is more
     # efficient?", "pros and cons?") match document wording that doesn't share
+<<<<<<< HEAD
     # the user's exact vocabulary. See _rewrite_and_translate() / _query_variants().
+=======
+    # the user's exact vocabulary. See _rewrite_query() / _query_variants().
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
     QUERY_EXPANSION_ENABLED: bool = _bool("QUERY_EXPANSION_ENABLED", True)
 
     # Chunking strategy: "recursive" (default, unchanged behavior — fixed
@@ -360,12 +394,21 @@ class Settings:
     DEFAULT_CONVERSATION_ID: str = os.getenv("DEFAULT_CONVERSATION_ID", "default")
 
     # ── Agent lifecycle (in-process agent/session.py registry) ─────────────
+<<<<<<< HEAD
     # A conversation's Agent — and the ShortMemory/FactStore/active_document
     # it owns in RAM — is evicted from the registry once it has had no
     # in-flight request AND has been inactive for this many seconds. A
     # later request with the same conversation_id transparently creates a
     # fresh Agent; only the in-RAM state is affected, not the persisted
     # memory_storage/*.json fact store. Default 1800s = 30 minutes.
+=======
+    # A conversation's Agent — and the ShortMemory/active_document it owns
+    # in RAM — is evicted from the registry once it has had no in-flight
+    # request AND has been inactive for this many seconds. A later request
+    # with the same conversation_id transparently creates a fresh Agent
+    # with empty memory (there is no persisted long-term store to reload —
+    # see memory/memory_manager.py). Default 1800s = 30 minutes.
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
     AGENT_IDLE_TIMEOUT_SECONDS: int = _int("AGENT_IDLE_TIMEOUT_SECONDS", 1800)
     # How often the background cleanup pass scans the registry for idle
     # conversations to evict. A conversation can live up to roughly
@@ -399,6 +442,7 @@ class Settings:
     LOG_RETRIEVAL_DEBUG: bool = _bool("LOG_RETRIEVAL_DEBUG", False)
 
     # ── Memory ───────────────────────────────────────────────────────────
+<<<<<<< HEAD
     MEMORY_MAX_MESSAGES: int = _int("MEMORY_MAX_MESSAGES", 25)
     MEMORY_KEEP_RECENT: int = _int("MEMORY_KEEP_RECENT", 4)
     MEMORY_WINDOW: int = _int("MEMORY_WINDOW", 6)
@@ -413,6 +457,20 @@ class Settings:
     MEMORY_SUMMARY_MAX_CHARS: int = _int("MEMORY_SUMMARY_MAX_CHARS", 1200)
     # Short-term memory also summarizes once total character count crosses
     # this budget, even if MEMORY_MAX_MESSAGES hasn't been reached yet — a
+=======
+    # Conversational memory is short-term only, kept in RAM for the life of
+    # the Agent instance (see agent/session.py's idle-eviction registry) —
+    # there is no long-term fact extraction or disk persistence.
+    MEMORY_MAX_MESSAGES: int = _int("MEMORY_MAX_MESSAGES", 25)
+    # Once the buffer exceeds MEMORY_MAX_MESSAGES or MEMORY_MAX_CHARS, it is
+    # trimmed back down to the most recent MEMORY_KEEP_RECENT messages.
+    MEMORY_KEEP_RECENT: int = _int("MEMORY_KEEP_RECENT", 4)
+    # How many of the most recent messages are rendered into the prompt
+    # text on any single call to MemoryManager.as_prompt_text().
+    MEMORY_WINDOW: int = _int("MEMORY_WINDOW", 6)
+    # Short-term memory also trims once total character count crosses this
+    # budget, even if MEMORY_MAX_MESSAGES hasn't been reached yet — a
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
     # handful of very long messages shouldn't be able to bloat token usage
     # before the message-count trigger fires.
     MEMORY_MAX_CHARS: int = _int("MEMORY_MAX_CHARS", 12000)
@@ -453,4 +511,8 @@ class Settings:
     )
 
 
+<<<<<<< HEAD
 settings = Settings()
+=======
+settings = Settings()
+>>>>>>> aac0288 (Initial commit - LASTVERSION)

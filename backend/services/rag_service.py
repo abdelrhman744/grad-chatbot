@@ -813,6 +813,7 @@ def _retrieve(
     metadata["source"] exactly matches it (used by topic-scoped report
     generation to search within one named document instead of the whole
     knowledge base) — applied client-side, AFTER the vector search.
+<<<<<<< HEAD
     `conversation_id` is required and restricts the vector search ITSELF
     (a Qdrant-side metadata filter, see `_conversation_filter`) to chunks
     uploaded by that conversation — see the Document Isolation
@@ -820,6 +821,18 @@ def _retrieve(
     caller must know which conversation it's retrieving for. Used
     internally by `ask_question` and exposed via `retrieve()` for the
     agent's retrieve tool. `raw_question` — see `_add_raw_question_anchor`.
+=======
+    `conversation_id` is kept as a parameter (existing callers all pass
+    it, and it's still used elsewhere — see `delete_conversation_documents`,
+    `reindex_document`) but is NOT used to scope this search: every
+    uploaded document is retrievable by every conversation, regardless of
+    which session uploaded it. (Per-conversation retrieval isolation was
+    removed — a document a staff member uploads needs to stay findable
+    after their browser tab closes, not just within the session that
+    uploaded it.) Used internally by `ask_question` and exposed via
+    `retrieve()` for the agent's retrieve tool. `raw_question` — see
+    `_add_raw_question_anchor`.
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 
     Returns (ranked_docs, debug_str, per_doc_debug) — `per_doc_debug` is
     the same length/order as `ranked_docs` and carries each doc's
@@ -830,7 +843,13 @@ def _retrieve(
     """
     vdb = _get_vector_db()
     search_k = k or settings.RETRIEVER_K
+<<<<<<< HEAD
     conv_filter = _conversation_filter(conversation_id)
+=======
+    # No conversation_id filter here (see docstring above) — search spans
+    # every indexed document, not just this conversation's own uploads.
+    conv_filter = None
+>>>>>>> aac0288 (Initial commit - LASTVERSION)
 
     with timing.stage("query_variant_generation_total"):
         variants = _query_variants(question, lang)
