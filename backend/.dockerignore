@@ -1,0 +1,33 @@
+# Python
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Environment / secrets
+.env
+
+# Vector DB (old embedded-mode local data — irrelevant once Qdrant runs
+# as its own container)
+qdrant_db/
+
+# Runtime state (mounted as volumes/bind-mounts in docker-compose.yml, or
+# regenerated on demand — not needed at build time)
+memory_storage/
+processed_files.json
+tmp_unused/
+
+# Caches / logs
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# IDE / VCS
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Docs (not needed inside the image)
+PROFILING.md

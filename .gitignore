@@ -1,0 +1,36 @@
+# Python
+backend/venv/
+backend/.venv/
+**/__pycache__/
+*.py[cod]
+
+# Environment (real secrets only — .env.example templates are committed)
+/.env
+backend/.env
+frontend/.env.local
+
+# Node
+frontend/node_modules/
+frontend/.next/
+
+# Vector DB
+backend/qdrant_db/
+backend/processed_files.json
+
+# Uploads
+backend/uploads/
+
+# Memory / registry state (runtime-generated, per-deployment)
+backend/memory_storage/
+backend/tmp_unused/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

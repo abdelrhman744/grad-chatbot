@@ -1,0 +1,153 @@
+# Full application stack: Qdrant (vector store), MinIO (object storage),
+# the FastAPI backend, and the Next.js frontend — all on one Docker
+# network, addressed by service name (never `localhost`).
+#
+# Usage:
+#   cp .env.example .env               # Compose-level vars (MinIO creds, Qdrant image tag)
+#   cp backend/.env.example backend/.env   # fill in GROQ_API_KEY at minimum
+#   docker compose up --build
+#
+#   Frontend:      http://localhost:3000
+#   Backend API:   http://localhost:8000/api/health
+#   Qdrant REST:   http://localhost:6333
+#   MinIO console: http://localhost:9001  (login: see .env / defaults below)
+#
+# No local/host-installed Qdrant, MinIO, Python, or Node is required —
+# everything the app needs runs in these four containers.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_IMAGE_TAG:-v1.19.0}
+    container_name: doc-assistant-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # The qdrant image ships no curl/wget — a plain TCP probe via bash's
+      # /dev/tcp is the standard workaround.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - app-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: doc-assistant-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: doc-backend
+    container_name: doc-assistant-backend
+    restart: unless-stopped
+    # GROQ_API_KEY and every other backend/.env.example var load from
+    # here; `required: false` so a fresh clone without backend/.env yet
+    # still boots (Groq calls just fail until the key is set).
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      # Docker-network service names — never localhost/127.0.0.1 inside
+      # the container.
+      QDRANT_URL: http://qdrant:6333
+      MINIO_ENDPOINT: minio:9000
+      # Presigned download URLs go to the browser, which runs on the host
+      # and can't resolve the `minio` service name — see storage_service.py.
+      MINIO_PUBLIC_ENDPOINT: localhost:9000
+      FRONTEND_ORIGIN: http://localhost:3000
+      # backend/.env's native-dev defaults point at Windows binary paths;
+      # the runtime image installs these on PATH via apt (see Dockerfile).
+      FFMPEG_PATH: ffmpeg
+      TESSERACT_CMD: tesseract
+    ports:
+      - "8000:8000"
+    volumes:
+      # HF/torch/sentence-transformers/Whisper/TrOCR (handwritten OCR)
+      # model cache — persisted so models download once, not on every
+      # `--build`. Never baked into the image itself. Hugging Face's
+      # default cache dir (~/.cache/huggingface) resolves to
+      # /root/.cache/huggingface inside this container, which falls under
+      # this same mount — no extra volume needed for the handwritten OCR
+      # models (see services/handwritten_ocr_service.py).
+      - backend_model_cache:/root/.cache
+      # Runtime state that predates this migration; bind-mounted so it
+      # survives container rebuilds same as it survived local restarts.
+      - ./backend/processed_files.json:/app/processed_files.json
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # The embedding + cross-encoder models load at FastAPI import time
+      # (before uvicorn even binds the port), and on first run download
+      # several GB from HuggingFace Hub — on a slow/unauthenticated
+      # connection this can take well past a couple of minutes. A long
+      # start_period avoids a slow first download flipping the container
+      # to "unhealthy" (which would abort the frontend's depends_on).
+      # Subsequent starts reuse the backend_model_cache volume and are fast.
+      start_period: 10m
+    networks:
+      - app-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Must be correct at BUILD time — next.config.js's rewrites() is
+        # frozen into .next/routes-manifest.json by `next build` and never
+        # re-evaluated at runtime, so setting this only in `environment:`
+        # below would be too late. See frontend/Dockerfile.
+        BACKEND_INTERNAL_URL: http://backend:8000
+    image: doc-frontend
+    container_name: doc-assistant-frontend
+    restart: unless-stopped
+    environment:
+      # Kept for any runtime code that reads it directly; the rewrite
+      # destination itself comes from the build ARG above, not this.
+      BACKEND_INTERNAL_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  qdrant_data:
+  minio_data:
+  backend_model_cache:
