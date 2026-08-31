@@ -1,0 +1,350 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { Globe2, Languages, Loader2, SendHorizontal, Sparkles, AlertTriangle } from "lucide-react";
+import { askVoice, resetConversation, streamChat, ChatResponse, ReportInfo } from "@/services/api";
+import { getConversationId } from "@/lib/conversation";
+import AnswerBox from "./AnswerBox";
+import SourceBox from "./SourceBox";
+import ReportCard from "./ReportCard";
+import VoiceRecorder from "./VoiceRecorder";
+import EmptyState from "@/components/ui/EmptyState";
+
+type Language = "auto" | "ar" | "en";
+
+interface Message {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  sources?: string;
+  stt?: string;
+  loading?: boolean;
+  statusText?: string;
+  report?: ReportInfo | null;
+  isError?: boolean;
+}
+
+interface Props {
+  resetSignal?: number;
+}
+
+const isArabicText = (text: string) => /[؀-ۿ]/.test(text);
+
+export default function ChatBox({ resetSignal }: Props) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [query, setQuery] = useState("");
+  const [language, setLanguage] = useState<Language>("auto");
+  const [submitting, setSubmitting] = useState(false);
+
+  // This tab's own conversation id (see lib/conversation.ts) — persists for
+  // the lifetime of the tab (sessionStorage), distinct from every other tab
+  // or user, so this component's state and the backend's Agent/memory for
+  // this conversation can never leak into another tab's conversation.
+  const [conversationId] = useState<string>(() => getConversationId());
+
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isFirstRender = useRef(true);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    resetConversation(conversationId).catch(() => {});
+    setMessages([]);
+  }, [resetSignal, conversationId]);
+
+  const addUserMessage = (text: string, stt?: string) => {
+    const id = crypto.randomUUID();
+
+    setMessages((prev) => [
+      ...prev,
+      { id, role: "user", text, stt },
+      { id: id + "-ai", role: "assistant", text: "", loading: true },
+    ]);
+
+    return id + "-ai";
+  };
+
+  const resolveAIMessage = (aiId: string, res: ChatResponse) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === aiId
+          ? {
+              ...m,
+              text: res.answer,
+              sources: res.sources,
+              report: res.report,
+              loading: false,
+            }
+          : m
+      )
+    );
+  };
+
+  const setAIStatus = (aiId: string, statusText: string) => {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === aiId ? { ...m, statusText, loading: true } : m))
+    );
+  };
+
+  const appendAIToken = (aiId: string, token: string) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === aiId ? { ...m, text: m.text + token, loading: false, statusText: undefined } : m
+      )
+    );
+  };
+
+  const finalizeAIMessage = (
+    aiId: string,
+    answer: string,
+    sources: string,
+    report?: ReportInfo | null
+  ) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === aiId
+          ? { ...m, text: answer || m.text, sources, loading: false, statusText: undefined, report }
+          : m
+      )
+    );
+  };
+
+  const failAIMessage = (aiId: string, err: string) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === aiId
+          ? {
+              ...m,
+              text: err,
+              loading: false,
+              statusText: undefined,
+              isError: true,
+            }
+          : m
+      )
+    );
+  };
+
+  const handleSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+
+    const q = query.trim();
+    if (!q || submitting) return;
+
+    setQuery("");
+    setSubmitting(true);
+
+    const aiId = addUserMessage(q);
+
+    streamChat(q, language, conversationId, {
+      onStatus: (text) => setAIStatus(aiId, text),
+      onToken: (token) => appendAIToken(aiId, token),
+      onDone: ({ answer, sources, report }) => {
+        finalizeAIMessage(aiId, answer, sources, report);
+        setSubmitting(false);
+      },
+      onError: (message) => {
+        failAIMessage(aiId, message);
+        setSubmitting(false);
+      },
+    });
+  };
+
+  const handleVoice = async (blob: Blob) => {
+    if (submitting) return;
+
+    setSubmitting(true);
+
+    const aiId = addUserMessage("Voice message…");
+
+    try {
+      const res = await askVoice(blob, language, conversationId);
+
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === aiId.replace("-ai", "")
+            ? { ...m, text: res.stt_text || "Voice message" }
+            : m
+        )
+      );
+
+      resolveAIMessage(aiId, res);
+    } catch (err: any) {
+      failAIMessage(aiId, err.message || "Voice processing failed");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
+
+  const LANG_OPTIONS: {
+    value: Language;
+    label: string;
+    icon: typeof Globe2;
+  }[] = [
+    { value: "auto", label: "Auto", icon: Globe2 },
+    { value: "ar", label: "العربية", icon: Languages },
+    { value: "en", label: "English", icon: Languages },
+  ];
+
+  return (
+    <div className="flex flex-col h-full" dir="ltr">
+      <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6 space-y-6">
+        {messages.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full">
+            <EmptyState
+              icon={Sparkles}
+              title="Ask about your documents"
+              subtitle="Upload files in the sidebar, then ask anything — I'll search your knowledge base for grounded answers."
+              className="py-20"
+            />
+          </div>
+        )}
+
+        {messages.map((msg, idx) => {
+          const isUser = msg.role === "user";
+          const isAr = isArabicText(msg.text);
+          const isLastMessage = idx === messages.length - 1;
+          const isStreaming = submitting && isLastMessage && !isUser && !msg.isError;
+
+          return (
+            <div
+              key={msg.id}
+              className={`flex w-full animate-fade-up ${
+                isUser ? "justify-end" : "justify-start"
+              }`}
+            >
+              <div
+                className={`
+                  max-w-[85%] sm:max-w-[75%] flex flex-col gap-1.5
+                  ${isUser ? "items-end" : "items-start"}
+                `}
+              >
+                {isUser ? (
+                  <div
+                    className={`
+                      px-4 py-3 rounded-2xl rounded-br-md
+                      bg-gradient-primary text-white shadow-card
+                      text-[15px] leading-relaxed whitespace-pre-wrap
+                      ${isAr ? "text-right font-arabic" : "text-left"}
+                    `}
+                    dir={isAr ? "rtl" : "ltr"}
+                  >
+                    {msg.text}
+                  </div>
+                ) : msg.isError ? (
+                  <div
+                    className="flex items-start gap-2.5 px-4 py-3 rounded-2xl rounded-bl-md
+                      bg-danger/10 border border-danger/30 text-danger
+                      text-sm leading-relaxed max-w-full animate-fade-up"
+                  >
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    <span>{msg.text}</span>
+                  </div>
+                ) : (
+                  <>
+                    <AnswerBox
+                      text={msg.text}
+                      isLoading={!!msg.loading}
+                      statusText={msg.statusText}
+                      streaming={isStreaming}
+                    />
+                    {msg.sources && <SourceBox sources={msg.sources} />}
+                    {msg.report && <ReportCard report={msg.report} isArabic={isArabicText(msg.text)} />}
+                  </>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        <div ref={bottomRef} />
+      </div>
+
+      <div className="border-t border-border glass px-4 sm:px-6 py-4">
+        <div className="flex gap-1.5 mb-3 justify-start">
+          {LANG_OPTIONS.map((opt) => {
+            const Icon = opt.icon;
+
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setLanguage(opt.value)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all
+                  ${
+                    language === opt.value
+                      ? "bg-gradient-primary text-white shadow-sm"
+                      : "bg-surface-2 text-muted hover:text-ink hover:bg-surface-3"
+                  }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <form onSubmit={handleSubmit} className="flex gap-2 items-end">
+          <VoiceRecorder
+            language={language}
+            disabled={submitting}
+            onResult={async (blob) => {
+              await handleVoice(blob);
+            }}
+          />
+
+          <div className="flex-1 relative">
+            <textarea
+              ref={textareaRef}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={handleKeyDown}
+              disabled={submitting}
+              placeholder="Ask a question about your documents... (Enter to send)"
+              rows={1}
+              className={`
+                w-full resize-none rounded-xl border border-border bg-surface-2
+                px-4 py-3 text-[15px] leading-relaxed text-ink
+                placeholder-subtle outline-none shadow-card
+                transition-all
+                focus:border-primary/60 focus:ring-2 focus:ring-primary/20
+                disabled:opacity-50
+                max-h-40 overflow-y-auto
+                ${isArabicText(query) ? "text-right font-arabic" : "text-left"}
+              `}
+              dir={isArabicText(query) ? "rtl" : "ltr"}
+            />
+          </div>
+
+          <button
+            type="submit"
+            disabled={!query.trim() || submitting}
+            className="w-10 h-10 rounded-xl bg-gradient-primary text-white flex items-center justify-center
+              hover:shadow-glow disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none
+              transition-all flex-shrink-0"
+          >
+            {submitting ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <SendHorizontal className="w-4 h-4" />
+            )}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,92 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Cairo:wght@400;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --base:    #0B1220;
+  --surface: #111827;
+  --surface-2: #182235;
+  --surface-3: #1F2A3D;
+  --border:  #22304A;
+  --ink:     #F1F5F9;
+  --muted:   #94A3B8;
+  --primary: #6366F1;
+  --primary-dark: #4F46E5;
+  --accent:  #06B6D4;
+  --success: #10B981;
+  --warning: #F59E0B;
+  --danger:  #EF4444;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  background: var(--base);
+  color: var(--ink);
+  font-family: 'IBM Plex Sans', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-image: radial-gradient(circle at 15% 0%, rgba(99, 102, 241, 0.14), transparent 45%),
+                     radial-gradient(circle at 100% 20%, rgba(6, 182, 212, 0.10), transparent 40%);
+  background-attachment: fixed;
+  background-repeat: no-repeat;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar       { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--border); background-clip: padding-box; }
+
+/* Arabic text */
+.arabic { font-family: 'Cairo', sans-serif; direction: rtl; }
+
+/* Selection */
+::selection { background: rgba(99, 102, 241, 0.35); color: var(--ink); }
+
+/* Typing dots */
+.typing-dot {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: pulseDot 1.4s infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+/* Glassmorphism surface — used for floating bars (input, mobile drawer) */
+.glass {
+  background: rgba(17, 24, 39, 0.72);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
+
+/* Shimmer skeleton (premium loading state, replaces flat pulse) */
+.skeleton-shimmer {
+  background: linear-gradient(90deg, var(--surface-2) 0%, var(--surface-3) 50%, var(--surface-2) 100%);
+  background-size: 800px 100%;
+}
+
+/* Streaming-text blinking cursor */
+.stream-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--primary);
+  animation: blink 1s step-start infinite;
+}
+
+/* Indeterminate upload progress bar */
+@keyframes upload-progress {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}

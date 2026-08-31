@@ -1,0 +1,38 @@
+name: Docker Build
+
+# Every push to any branch, and every pull request, builds both images
+# (backend: Tesseract/OpenCV OCR + FastAPI; frontend: Next.js) to catch a
+# broken Dockerfile or dependency change before it reaches main. Build-only
+# — nothing is pushed to a registry, so no secrets are required.
+"on":
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  build:
+    name: Build ${{ matrix.service }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.service }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          file: ./${{ matrix.service }}/Dockerfile
+          push: false
+          tags: grad-chatbot-${{ matrix.service }}:ci
+          # GitHub Actions cache backend — speeds up repeat builds across
+          # runs without needing a registry. Safe no-op on first run.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
